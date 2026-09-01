@@ -197,6 +197,24 @@ def test_exception_id_with_newline_is_rejected(tmp_path):
         load(_write(tmp_path, text))
 
 
+def test_exception_id_with_trailing_newline_only_is_rejected(tmp_path):
+    """Regression test for the match->fullmatch fix.
+
+    `$` without re.MULTILINE matches both at the true end of string AND just
+    before a trailing newline at the end of the string. An id that is
+    otherwise valid, followed by a single trailing "\\n" and nothing else,
+    is the one shape that `ID_PATTERN.match()` would have let through even
+    though `ID_PATTERN.fullmatch()` rejects it — the two existing newline
+    tests above append content *after* the newline, which `.match()` already
+    caught, so neither exercises this quirk.
+    """
+    text = VALID_ENTRY.replace(
+        "id: PYSEC-2026-3412", 'id: "GHSA-a\\n"'
+    )
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
 @pytest.mark.parametrize("bad", ["GHSA a", "GHSA-a;rm -rf /", "GHSA-$(id)", "GHSA-a>out"])
 def test_exception_ids_with_shell_metacharacters_are_rejected(tmp_path, bad):
     text = VALID_ENTRY.replace("id: PYSEC-2026-3412", f'id: "{bad}"')
@@ -252,6 +270,20 @@ def test_gitleaks_id_with_space_is_rejected(tmp_path):
     text = VALID_ENTRY.replace("scanner: pip-audit", "scanner: gitleaks")
     text = text.replace(
         "id: PYSEC-2026-3412", 'id: "abc:def:rule id:1"'
+    )
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
+def test_gitleaks_id_with_trailing_newline_only_is_rejected(tmp_path):
+    """Same regression as test_exception_id_with_trailing_newline_only_is_
+    rejected, but for GITLEAKS_ID_PATTERN (`^\\S+$`): a fingerprint followed
+    by a single trailing "\\n" and nothing else is exactly the shape
+    `.match()` would wrongly accept and `.fullmatch()` correctly rejects.
+    """
+    text = VALID_ENTRY.replace("scanner: pip-audit", "scanner: gitleaks")
+    text = text.replace(
+        "id: PYSEC-2026-3412", 'id: "abc:def:rule:1\\n"'
     )
     with pytest.raises(ExceptionFileError, match="invalid id"):
         load(_write(tmp_path, text))
