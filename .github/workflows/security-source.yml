@@ -47,9 +47,12 @@ jobs:
           python-version: '3.12'
       - run: pip install pyyaml
       - name: Validate schema and fail on expired entries
+        env:
+          TOOLING_PATH: ${{ env.TOOLING_PATH }}
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
         run: |
-          python ${{ env.TOOLING_PATH }}/scripts/security_exceptions.py \
-            --file '${{ inputs.exceptions-file }}' --check-expiry
+          python "$TOOLING_PATH"/scripts/security_exceptions.py \
+            --file "$EXCEPTIONS_FILE" --check-expiry
 
   sast-python:
     name: Python SAST (Bandit)
@@ -62,8 +65,11 @@ jobs:
           python-version: '3.12'
       - run: pip install bandit
       - name: Run Bandit
+        env:
+          PYTHON_PATHS: ${{ inputs.python-paths }}
         run: |
-          bandit -r ${{ inputs.python-paths }} -ll --confidence-level=medium \
+          # shellcheck disable=SC2086
+          bandit -r $PYTHON_PATHS -ll --confidence-level=medium \
             -x '*/node_modules/*,*/.venv/*,*/dist/*,*/.worktrees/*,*/.wt-*,*/tests/*'
 
   sca-python:
@@ -88,9 +94,12 @@ jobs:
 
       - name: Collect ignore arguments
         id: ignores
+        env:
+          TOOLING_PATH: ${{ env.TOOLING_PATH }}
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
         run: |
-          ARGS=$(python ${{ env.TOOLING_PATH }}/scripts/security_exceptions.py \
-                   --file '${{ inputs.exceptions-file }}' --emit-args)
+          ARGS=$(python "$TOOLING_PATH"/scripts/security_exceptions.py \
+                   --file "$EXCEPTIONS_FILE" --emit-args)
           echo "args=$ARGS" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
@@ -102,16 +111,23 @@ jobs:
 
       - name: Audit uv lockfile
         if: inputs.python-uv
+        env:
+          PIP_AUDIT_ARGS: ${{ steps.ignores.outputs.args }}
         run: |
           uv export --format requirements-txt --no-emit-project \
             --no-hashes --all-extras --no-dev > /tmp/uv-reqs.txt
-          pip-audit --desc on -r /tmp/uv-reqs.txt ${{ steps.ignores.outputs.args }}
+          # shellcheck disable=SC2086
+          pip-audit --desc on -r /tmp/uv-reqs.txt $PIP_AUDIT_ARGS
 
       - name: Audit requirements files
         if: '!inputs.python-uv'
+        env:
+          PYTHON_REQS: ${{ inputs.python-requirements }}
+          PIP_AUDIT_ARGS: ${{ steps.ignores.outputs.args }}
         run: |
-          for f in ${{ inputs.python-requirements }}; do
+          # shellcheck disable=SC2086
+          for f in $PYTHON_REQS; do
             echo "::group::pip-audit $f"
-            pip-audit --desc on -r "$f" ${{ steps.ignores.outputs.args }}
+            pip-audit --desc on -r "$f" $PIP_AUDIT_ARGS
             echo "::endgroup::"
           done
