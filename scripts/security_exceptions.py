@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,9 +23,23 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 VALID_SCANNERS: tuple[str, ...] = ("pip-audit", "trivy", "npm")
 NPM_BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 
+# Exception ids are interpolated into scanner command lines and into
+# $GITHUB_OUTPUT. A newline or a shell metacharacter in a caller-authored id
+# would let a PR inject extra step outputs or extra arguments, so the id is
+# restricted to the character set every real advisory id already uses.
+ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# Reported npm findings that carry no resolvable advisory id are labelled with
+# this prefix so a package name is never mistaken for an advisory id.
+NPM_PACKAGE_PREFIX = "package:"
+
 
 class ExceptionFileError(ValueError):
     """The exception file is malformed or violates policy."""
+
+
+class NpmAuditError(ValueError):
+    """`npm audit` did not produce a usable report — the scan did not happen."""
 
 
 @dataclass(frozen=True)
@@ -64,6 +79,11 @@ def load(path: str | Path) -> list[SecurityException]:
             raise ExceptionFileError(
                 f"{path}: entry {i} field 'recheck' must be a YAML date "
                 f"(YYYY-MM-DD), got {entry['recheck']!r}"
+            )
+        if not ID_PATTERN.match(str(entry["id"])):
+            raise ExceptionFileError(
+                f"{path}: entry {i} has invalid id {entry['id']!r}; ids must match "
+                f"{ID_PATTERN.pattern} (letters, digits, dot, underscore, hyphen)"
             )
         if entry["id"] in seen:
             raise ExceptionFileError(f"{path}: duplicate exception id {entry['id']!r}")
@@ -113,15 +133,45 @@ def _advisory_ids(entry: dict) -> list[str]:
 
 
 def npm_unexcepted(audit_json: dict, excs: list[SecurityException]) -> list[str]:
-    """Advisory ids at high/critical that no npm-scanner exception covers."""
+    """Blocking npm findings that no npm-scanner exception covers.
+
+    Raises NpmAuditError when the report has no `vulnerabilities` key. `npm
+    audit` exits non-zero both on findings and on genuine failures (registry
+    outage, ENOLOCK, EAUDITNOPJSON), and the workflow cannot tell the two apart
+    from the exit code, so a report that never audited anything must fail the
+    job rather than read as a clean scan.
+    """
+    if not isinstance(audit_json, dict) or "vulnerabilities" not in audit_json:
+        detail = ""
+        if isinstance(audit_json, dict) and "error" in audit_json:
+            err = audit_json["error"]
+            if isinstance(err, dict):
+                parts = [str(err[k]) for k in ("code", "summary", "detail") if err.get(k)]
+                detail = f": {' — '.join(parts)}" if parts else f": {err!r}"
+            else:
+                detail = f": {err!r}"
+        raise NpmAuditError(
+            "npm audit produced no 'vulnerabilities' report — nothing was "
+            f"audited, failing closed{detail}"
+        )
+
     allowed = {e.id for e in excs if e.scanner == "npm"}
     found: list[str] = []
-    for entry in (audit_json.get("vulnerabilities") or {}).values():
-        if entry.get("severity") not in NPM_BLOCKING_SEVERITIES:
+    for pkg, entry in (audit_json.get("vulnerabilities") or {}).items():
+        if not isinstance(entry, dict):
             continue
-        for aid in _advisory_ids(entry):
-            if aid not in allowed and aid not in found:
-                found.append(aid)
+        if str(entry.get("severity", "")).lower() not in NPM_BLOCKING_SEVERITIES:
+            continue
+        ids = _advisory_ids(entry)
+        # A blocking entry that resolves to no advisory id is still a blocking
+        # entry: report it by its package key rather than dropping it.
+        if not ids:
+            ids = [f"{NPM_PACKAGE_PREFIX}{pkg}"]
+        for aid in ids:
+            bare = aid[len(NPM_PACKAGE_PREFIX):] if aid.startswith(NPM_PACKAGE_PREFIX) else aid
+            if aid in allowed or bare in allowed or aid in found:
+                continue
+            found.append(aid)
     return found
 
 
@@ -159,10 +209,19 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.emit_trivyignore).write_text(trivyignore_text(excs))
 
     if args.npm_audit_json:
-        audit = json.loads(Path(args.npm_audit_json).read_text())
-        blocking = npm_unexcepted(audit, excs)
+        try:
+            audit = json.loads(Path(args.npm_audit_json).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"::error::cannot read npm audit report {args.npm_audit_json}: {exc}",
+                  file=sys.stderr)
+            return 1
+        try:
+            blocking = npm_unexcepted(audit, excs)
+        except NpmAuditError as exc:
+            print(f"::error::{exc}", file=sys.stderr)
+            return 1
         for aid in blocking:
-            print(f"::error::npm advisory {aid} is high or critical and has no exception.",
+            print(f"::error::npm finding {aid} is high or critical and has no exception.",
                   file=sys.stderr)
         if blocking:
             return 1

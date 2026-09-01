@@ -1,8 +1,8 @@
 import datetime as dt
 import pytest
 from scripts.security_exceptions import (
-    ExceptionFileError, SecurityException, load,
-    expired, npm_unexcepted, pip_audit_args, trivyignore_text,
+    ExceptionFileError, NpmAuditError, SecurityException, load,
+    expired, main, npm_unexcepted, pip_audit_args, trivyignore_text,
 )
 
 VALID_ENTRY = """
@@ -132,4 +132,84 @@ def test_npm_unexcepted_handles_mixed_via_shapes():
         ]},
         "only-string-via": {"severity": "high", "via": ["lodash"]},
     }}
-    assert npm_unexcepted(audit, []) == ["GHSA-aaa"]
+    # A blocking entry that resolves to no advisory id must still be reported,
+    # by package key — dropping it would be a silent fail-open.
+    assert npm_unexcepted(audit, []) == ["GHSA-aaa", "package:only-string-via"]
+
+
+def test_npm_unexcepted_reports_blocking_entry_with_unresolvable_via():
+    audit = {"vulnerabilities": {
+        "left-pad": {"severity": "critical", "via": [{"source": 123, "title": "t"}]},
+    }}
+    assert npm_unexcepted(audit, []) == ["package:left-pad"]
+
+
+def test_npm_unexcepted_package_fallback_respects_exception_on_package_name():
+    audit = {"vulnerabilities": {
+        "left-pad": {"severity": "critical", "via": [{"source": 123, "title": "t"}]},
+    }}
+    assert npm_unexcepted(audit, [_exc("left-pad", scanner="npm")]) == []
+
+
+def test_npm_unexcepted_severity_comparison_is_case_insensitive():
+    audit = {"vulnerabilities": {
+        "lodash": {"severity": "Critical", "via": [{"url": "https://github.com/advisories/GHSA-aaa"}]},
+        "chalk": {"severity": "HIGH", "via": [{"url": "https://github.com/advisories/GHSA-bbb"}]},
+        "quiet": {"severity": "Moderate", "via": [{"url": "https://github.com/advisories/GHSA-ccc"}]},
+    }}
+    assert npm_unexcepted(audit, []) == ["GHSA-aaa", "GHSA-bbb"]
+
+
+def test_npm_unexcepted_rejects_error_shaped_report():
+    """`npm audit` writes {"error": ...} on registry outage / ENOLOCK and still
+    exits non-zero; the workflow's `|| true` swallows that, so an audit report
+    with no `vulnerabilities` key must fail closed, never read as clean."""
+    audit = {"error": {"code": "ENOLOCK", "summary": "no lockfile", "detail": "…"}}
+    with pytest.raises(NpmAuditError, match="ENOLOCK"):
+        npm_unexcepted(audit, [])
+
+
+def test_npm_unexcepted_rejects_report_without_vulnerabilities_key():
+    with pytest.raises(NpmAuditError, match="vulnerabilities"):
+        npm_unexcepted({}, [])
+
+
+def test_npm_unexcepted_accepts_empty_vulnerabilities_map():
+    assert npm_unexcepted({"vulnerabilities": {}}, []) == []
+
+
+def test_cli_fails_on_error_shaped_npm_audit_json(tmp_path, capsys):
+    """End to end: the exit code, not just the function, must be non-zero."""
+    report = tmp_path / "audit.json"
+    report.write_text('{"error": {"code": "ENOLOCK", "summary": "no lockfile"}}')
+    rc = main(["--file", str(tmp_path / "nope.yml"), "--npm-audit-json", str(report)])
+    assert rc == 1
+    assert "ENOLOCK" in capsys.readouterr().err
+
+
+def test_exception_id_with_newline_is_rejected(tmp_path):
+    """An id carrying a newline would inject extra keys into $GITHUB_OUTPUT."""
+    text = VALID_ENTRY.replace(
+        "id: PYSEC-2026-3412", 'id: "GHSA-a\\nEVIL=1"'
+    )
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
+@pytest.mark.parametrize("bad", ["GHSA a", "GHSA-a;rm -rf /", "GHSA-$(id)", "GHSA-a>out"])
+def test_exception_ids_with_shell_metacharacters_are_rejected(tmp_path, bad):
+    text = VALID_ENTRY.replace("id: PYSEC-2026-3412", f'id: "{bad}"')
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
+def test_trivyignore_text_excludes_other_scanners():
+    """Negative isolation: a pip-audit exception must never reach trivy."""
+    text = trivyignore_text([
+        _exc("CVE-1", scanner="trivy"),
+        _exc("PYSEC-2026-3412", scanner="pip-audit"),
+        _exc("GHSA-aaa", scanner="npm"),
+    ])
+    assert "CVE-1" in text
+    assert "PYSEC-2026-3412" not in text
+    assert "GHSA-aaa" not in text

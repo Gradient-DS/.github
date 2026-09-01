@@ -1,7 +1,10 @@
 """Build the issue a failed scheduled security scan opens.
 
-A stable title lets `gh issue list --search` find the existing issue, so weekly
-failures append to one thread instead of opening a new issue every Monday.
+The title is stable and exact: the workflow lists open `security`-labelled
+issues and matches this title verbatim with jq, so weekly failures append to
+one thread instead of opening a new issue every Monday. Do not make the title
+vary per run, and do not add characters that would need escaping in a jq
+comparison.
 """
 from __future__ import annotations
 
