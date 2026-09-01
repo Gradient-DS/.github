@@ -163,11 +163,17 @@ jobs:
         run: |
           for d in $NODE_DIRS; do
             echo "::group::npm audit $d"
-            ( cd "$d" && npm ci --ignore-scripts && \
-              npm audit --json > /tmp/npm-audit.json || true )
+            AUDIT_JSON="$(mktemp)"
+            ( cd "$d" && npm ci --ignore-scripts ) || {
+              echo "::error::npm ci failed in $d — cannot audit, failing closed"
+              rm -f "$AUDIT_JSON"
+              exit 1
+            }
+            ( cd "$d" && npm audit --json ) > "$AUDIT_JSON" || true
             python "$TOOLING/scripts/security_exceptions.py" \
               --file "$EXCEPTIONS_FILE" \
-              --npm-audit-json /tmp/npm-audit.json
+              --npm-audit-json "$AUDIT_JSON"
+            rm -f "$AUDIT_JSON"
             echo "::endgroup::"
           done
 
