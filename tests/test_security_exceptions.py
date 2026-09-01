@@ -2,6 +2,7 @@ import datetime as dt
 import pytest
 from scripts.security_exceptions import (
     ExceptionFileError, SecurityException, load,
+    expired, npm_unexcepted, pip_audit_args, trivyignore_text,
 )
 
 VALID_ENTRY = """
@@ -72,3 +73,52 @@ def test_whitespace_only_required_field_is_rejected(tmp_path):
     )
     with pytest.raises(ExceptionFileError, match="usage_analysis"):
         load(_write(tmp_path, text))
+
+
+def _exc(id_, scanner="pip-audit", recheck=dt.date(2026, 12, 1)):
+    return SecurityException(
+        id=id_, package="pkg", scanner=scanner, reason="r",
+        replacement_considered="rc", usage_analysis="ua",
+        approved_by="@r", recheck=recheck,
+    )
+
+
+def test_expired_returns_only_past_recheck_dates():
+    fresh = _exc("A", recheck=dt.date(2026, 12, 1))
+    stale = _exc("B", recheck=dt.date(2026, 8, 1))
+    assert expired([fresh, stale], today=dt.date(2026, 9, 1)) == [stale]
+
+
+def test_recheck_date_is_inclusive():
+    on_the_day = _exc("A", recheck=dt.date(2026, 9, 1))
+    assert expired([on_the_day], today=dt.date(2026, 9, 1)) == []
+
+
+def test_pip_audit_args_only_include_pip_audit_scanner():
+    excs = [_exc("A"), _exc("B", scanner="trivy")]
+    assert pip_audit_args(excs) == ["--ignore-vuln", "A"]
+
+
+def test_pip_audit_args_empty_when_no_exceptions():
+    assert pip_audit_args([]) == []
+
+
+def test_trivyignore_text_lists_ids_with_comments():
+    text = trivyignore_text([_exc("CVE-1", scanner="trivy")])
+    assert "CVE-1" in text
+    assert "pkg" in text
+
+
+def test_npm_unexcepted_flags_high_and_critical_only():
+    audit = {"vulnerabilities": {
+        "lodash":  {"severity": "critical", "via": [{"url": "https://github.com/advisories/GHSA-aaa"}]},
+        "chalk":   {"severity": "moderate", "via": [{"url": "https://github.com/advisories/GHSA-bbb"}]},
+    }}
+    assert npm_unexcepted(audit, []) == ["GHSA-aaa"]
+
+
+def test_npm_unexcepted_respects_exceptions():
+    audit = {"vulnerabilities": {
+        "lodash": {"severity": "critical", "via": [{"url": "https://github.com/advisories/GHSA-aaa"}]},
+    }}
+    assert npm_unexcepted(audit, [_exc("GHSA-aaa", scanner="npm")]) == []

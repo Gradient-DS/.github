@@ -76,3 +76,102 @@ def load(path: str | Path) -> list[SecurityException]:
             recheck=entry["recheck"],
         ))
     return out
+
+
+import argparse
+import json
+import sys
+
+NPM_BLOCKING_SEVERITIES = frozenset({"high", "critical"})
+
+
+def expired(excs: list[SecurityException], today: dt.date) -> list[SecurityException]:
+    """Entries whose recheck date has passed. Inclusive: due today is not expired."""
+    return [e for e in excs if e.recheck < today]
+
+
+def pip_audit_args(excs: list[SecurityException]) -> list[str]:
+    args: list[str] = []
+    for e in excs:
+        if e.scanner == "pip-audit":
+            args += ["--ignore-vuln", e.id]
+    return args
+
+
+def trivyignore_text(excs: list[SecurityException]) -> str:
+    lines = ["# Generated from .github/security-exceptions.yml — do not edit by hand."]
+    for e in excs:
+        if e.scanner == "trivy":
+            lines.append(f"# {e.package}: {e.reason} (approved by {e.approved_by}, recheck {e.recheck})")
+            lines.append(e.id)
+    return "\n".join(lines) + "\n"
+
+
+def _advisory_ids(entry: dict) -> list[str]:
+    ids = []
+    for via in entry.get("via", []):
+        if isinstance(via, dict) and "url" in via:
+            ids.append(via["url"].rstrip("/").split("/")[-1])
+    return ids
+
+
+def npm_unexcepted(audit_json: dict, excs: list[SecurityException]) -> list[str]:
+    """Advisory ids at high/critical that no npm-scanner exception covers."""
+    allowed = {e.id for e in excs if e.scanner == "npm"}
+    found: list[str] = []
+    for entry in (audit_json.get("vulnerabilities") or {}).values():
+        if entry.get("severity") not in NPM_BLOCKING_SEVERITIES:
+            continue
+        for aid in _advisory_ids(entry):
+            if aid not in allowed and aid not in found:
+                found.append(aid)
+    return found
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--file", required=True)
+    ap.add_argument("--emit-args", action="store_true")
+    ap.add_argument("--emit-trivyignore")
+    ap.add_argument("--check-expiry", action="store_true")
+    ap.add_argument("--npm-audit-json")
+    args = ap.parse_args(argv)
+
+    try:
+        excs = load(args.file)
+    except ExceptionFileError as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        return 1
+
+    if args.check_expiry:
+        stale = expired(excs, dt.date.today())
+        for e in stale:
+            print(
+                f"::error::Security exception {e.id} ({e.package}) expired on "
+                f"{e.recheck}. Re-verify with @Gradient-DS/security, fix the "
+                f"finding, or extend the recheck date with fresh analysis.",
+                file=sys.stderr,
+            )
+        if stale:
+            return 1
+
+    if args.emit_args:
+        print(" ".join(pip_audit_args(excs)))
+
+    if args.emit_trivyignore:
+        Path(args.emit_trivyignore).write_text(trivyignore_text(excs))
+
+    if args.npm_audit_json:
+        audit = json.loads(Path(args.npm_audit_json).read_text())
+        blocking = npm_unexcepted(audit, excs)
+        for aid in blocking:
+            print(f"::error::npm advisory {aid} is high or critical and has no exception.",
+                  file=sys.stderr)
+        if blocking:
+            return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
