@@ -1,0 +1,80 @@
+name: Security Scanning (image)
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: 'Docker build context, e.g. ./server'
+        type: string
+        required: true
+      dockerfile:
+        description: 'Dockerfile path relative to the repo root.'
+        type: string
+        required: true
+      image-name:
+        description: 'Local tag for the built image; appears in scan output.'
+        type: string
+        required: true
+      build-args:
+        description: 'Newline-separated KEY=VALUE build args.'
+        type: string
+        default: ''
+      exceptions-file:
+        type: string
+        default: '.github/security-exceptions.yml'
+
+jobs:
+  scan:
+    name: Container Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: v1
+          path: .security-tooling
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+
+      - name: Generate .trivyignore from exceptions
+        env:
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+        run: |
+          python .security-tooling/scripts/security_exceptions.py \
+            --file "$EXCEPTIONS_FILE" \
+            --check-expiry --emit-trivyignore .trivyignore
+
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@v4.1
+        with:
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          push: false
+          tags: ${{ inputs.image-name }}:scan
+          build-args: ${{ inputs.build-args }}
+          cache-from: type=gha
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: '${{ inputs.image-name }}:scan'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+          trivyignores: '.trivyignore'
