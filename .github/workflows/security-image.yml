@@ -50,7 +50,10 @@ jobs:
             --check-expiry --emit-trivyignore .trivyignore
 
       - name: Maximize build space
-        uses: AdityaGarg8/remove-unwanted-software@v4.1
+        # SHA-pinned, not tag-pinned: this is the suite's only non-mainstream
+        # third-party action and a mutable tag would let a retag execute
+        # arbitrary code inside a security gate across nine repos.
+        uses: AdityaGarg8/remove-unwanted-software@8831c82abf29b34eb2caac48d5f999ecfc0d8eef # v4.1
         with:
           remove-android: 'true'
           remove-haskell: 'true'
