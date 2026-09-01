@@ -131,3 +131,91 @@ jobs:
             pip-audit --desc on -r "$f" $PIP_AUDIT_ARGS
             echo "::endgroup::"
           done
+
+  sca-node:
+    name: Node Dependencies (npm audit)
+    if: inputs.node-dirs != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: v1
+          path: ${{ env.TOOLING_PATH }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - name: Audit each Node directory
+        env:
+          # Values reach the shell through env, never interpolated into the
+          # script text: a `${{ }}` substitution happens BEFORE the shell parses
+          # the line, so metacharacters in a value would execute. NODE_DIRS is
+          # expanded unquoted on purpose — word-splitting is wanted, command
+          # substitution is not, and expansion results are never re-evaluated.
+          NODE_DIRS: ${{ inputs.node-dirs }}
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+          TOOLING: ${{ env.TOOLING_PATH }}
+        run: |
+          for d in $NODE_DIRS; do
+            echo "::group::npm audit $d"
+            ( cd "$d" && npm ci --ignore-scripts && \
+              npm audit --json > /tmp/npm-audit.json || true )
+            python "$TOOLING/scripts/security_exceptions.py" \
+              --file "$EXCEPTIONS_FILE" \
+              --npm-audit-json /tmp/npm-audit.json
+            echo "::endgroup::"
+          done
+
+  secrets:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0    # gitleaks scans full history, not just the tip
+      - name: Install gitleaks
+        env:
+          GITLEAKS_TAG: v8.30.1
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_TAG}/gitleaks_${GITLEAKS_TAG#v}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Scan history
+        run: gitleaks git . --redact --exit-code 1 --verbose
+
+  iac:
+    name: IaC (trivy config)
+    if: inputs.trivy-config-paths != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: v1
+          path: ${{ env.TOOLING_PATH }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - name: Generate .trivyignore from exceptions
+        env:
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+          TOOLING: ${{ env.TOOLING_PATH }}
+        run: |
+          python "$TOOLING/scripts/security_exceptions.py" \
+            --file "$EXCEPTIONS_FILE" \
+            --emit-trivyignore .trivyignore
+      - name: Run trivy config
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: 'config'
+          scan-ref: '${{ inputs.trivy-config-paths }}'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          trivyignores: '.trivyignore'
