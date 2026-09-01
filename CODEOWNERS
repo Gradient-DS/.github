@@ -1,0 +1,4 @@
+# The reusable security workflows and their helpers gate nine repos.
+# Changes here require the security team.
+/scripts/                          @Gradient-DS/security
+/.github/workflows/security-*.yml  @Gradient-DS/security
