@@ -27,6 +27,13 @@ on:
         description: 'Path to the per-repo exception file, relative to the caller repo root.'
         type: string
         default: '.github/security-exceptions.yml'
+      tooling-ref:
+        description: >-
+          Ref of Gradient-DS/.github to take the helper scripts from. Defaults to
+          the release tag; override to test a paired workflow + helper change on a
+          branch, or to keep the helper in step with a caller pinned at @main.
+        type: string
+        default: 'v1'
 
 env:
   TOOLING_PATH: .security-tooling
@@ -40,7 +47,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: Gradient-DS/.github
-          ref: v1
+          ref: ${{ inputs.tooling-ref }}
           path: ${{ env.TOOLING_PATH }}
       - uses: actions/setup-python@v6
         with:
@@ -83,7 +90,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: Gradient-DS/.github
-          ref: v1
+          ref: ${{ inputs.tooling-ref }}
           path: ${{ env.TOOLING_PATH }}
 
       - uses: actions/setup-python@v6
@@ -141,7 +148,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: Gradient-DS/.github
-          ref: v1
+          ref: ${{ inputs.tooling-ref }}
           path: ${{ env.TOOLING_PATH }}
       - uses: actions/setup-node@v6
         with:
@@ -161,6 +168,13 @@ jobs:
           EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
           TOOLING: ${{ env.TOOLING_PATH }}
         run: |
+          # pipefail is safe alongside the deliberate `|| true` below: that
+          # `|| true` covers a plain command group, not a pipeline, so npm's
+          # non-zero exit on findings is still ignored while a genuine npm
+          # failure is caught downstream — npm writes {"error": {...}} instead
+          # of a `vulnerabilities` report, and the helper fails closed on that.
+          set -o pipefail
+
           for d in $NODE_DIRS; do
             echo "::group::npm audit $d"
             AUDIT_JSON="$(mktemp)"
@@ -188,8 +202,28 @@ jobs:
         env:
           GITLEAKS_TAG: v8.30.1
         run: |
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_TAG}/gitleaks_${GITLEAKS_TAG#v}_linux_x64.tar.gz" \
-            | tar -xz -C /usr/local/bin gitleaks
+          # pipefail: the default shell is `bash -e {0}`, so without this a
+          # failing curl in `curl | tar` is masked by tar's exit status.
+          set -euo pipefail
+
+          VERSION="${GITLEAKS_TAG#v}"
+          BASE="https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_TAG}"
+          TARBALL="gitleaks_${VERSION}_linux_x64.tar.gz"
+          WORK="$(mktemp -d)"
+
+          # Download, then verify against the checksums file published with the
+          # release, then extract. `gitleaks version` only catches a truncated
+          # download; it cannot detect a substituted binary.
+          curl -sSfL -o "$WORK/$TARBALL" "$BASE/$TARBALL"
+          curl -sSfL -o "$WORK/checksums.txt" "$BASE/gitleaks_${VERSION}_checksums.txt"
+
+          ( cd "$WORK" && grep " ${TARBALL}\$" checksums.txt | sha256sum -c - ) || {
+            echo "::error::gitleaks ${GITLEAKS_TAG} checksum verification failed — refusing to run an unverified binary"
+            exit 1
+          }
+
+          tar -xzf "$WORK/$TARBALL" -C /usr/local/bin gitleaks
+          rm -rf "$WORK"
           gitleaks version
       - name: Scan history
         run: gitleaks git . --redact --exit-code 1 --verbose
@@ -203,28 +237,64 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: Gradient-DS/.github
-          ref: v1
+          ref: ${{ inputs.tooling-ref }}
           path: ${{ env.TOOLING_PATH }}
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - run: pip install pyyaml
-      - name: Generate .trivyignore from exceptions
+      - name: Generate ignore file from exceptions
         env:
           EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
           TOOLING: ${{ env.TOOLING_PATH }}
+          # Written outside the workspace: `.trivyignore` at the repo root would
+          # silently overwrite a caller-owned file of that name.
+          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
         run: |
           python "$TOOLING/scripts/security_exceptions.py" \
             --file "$EXCEPTIONS_FILE" \
-            --emit-trivyignore .trivyignore
-      - name: Run trivy config
-        uses: aquasecurity/trivy-action@v0.36.0
+            --emit-trivyignore "$TRIVYIGNORE_PATH"
+
+      # `trivy config` takes exactly one target, but trivy-config-paths is
+      # documented as space-separated and one repo needs four roots. The action
+      # cannot be run a variable number of times, so install the same pinned
+      # trivy the action would install (trivy-action@v0.36.0 ships v0.70.0) and
+      # loop the CLI.
+      - name: Install trivy
+        uses: aquasecurity/setup-trivy@v0.3.1
         with:
-          scan-type: 'config'
-          scan-ref: '${{ inputs.trivy-config-paths }}'
-          severity: 'CRITICAL,HIGH'
-          exit-code: '1'
-          trivyignores: '.trivyignore'
+          version: v0.70.0
+          cache: true
+
+      - name: Run trivy config on each path
+        env:
+          # Unquoted expansion below is deliberate: word-splitting is wanted,
+          # command substitution is not.
+          TRIVY_CONFIG_PATHS: ${{ inputs.trivy-config-paths }}
+          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
+        run: |
+          set -uo pipefail
+
+          # Every path is scanned even after one fails, so a single run reports
+          # every offending root; the accumulator makes sure a later clean path
+          # cannot mask an earlier failure.
+          rc=0
+          # shellcheck disable=SC2086
+          for p in $TRIVY_CONFIG_PATHS; do
+            echo "::group::trivy config $p"
+            if [ ! -e "$p" ]; then
+              echo "::error::trivy config path '$p' does not exist — failing closed rather than reporting a clean scan"
+              rc=1
+              echo "::endgroup::"
+              continue
+            fi
+            trivy config "$p" \
+              --severity CRITICAL,HIGH \
+              --exit-code 1 \
+              --ignorefile "$TRIVYIGNORE_PATH" || rc=1
+            echo "::endgroup::"
+          done
+          exit "$rc"
 
   notify-scheduled-failure:
     name: Notify on scheduled failure
@@ -232,12 +302,15 @@ jobs:
     if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
     runs-on: ubuntu-latest
     permissions:
+      # `issues: write` alone drops the implicit `contents: read`, which the two
+      # checkout steps below need.
+      contents: read
       issues: write
     steps:
       - uses: actions/checkout@v6
         with:
           repository: Gradient-DS/.github
-          ref: v1
+          ref: ${{ inputs.tooling-ref }}
           path: .security-tooling
       - uses: actions/setup-python@v6
         with:
@@ -249,6 +322,11 @@ jobs:
           NEEDS_JSON: ${{ toJson(needs) }}
           TOOLING: .security-tooling
         run: |
+          # pipefail: without it a failing `printf`/`gh` in the pipelines below
+          # is masked by jq's exit status, and the notifier would act on an
+          # empty job list or an empty issue list.
+          set -o pipefail
+
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
           FAILED_JOBS=$(printf '%s' "$NEEDS_JSON" \
             | jq -r 'to_entries | map(select(.value.result == "failure") | .key) | join(",")')

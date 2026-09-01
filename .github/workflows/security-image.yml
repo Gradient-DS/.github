@@ -22,18 +22,29 @@ on:
       exceptions-file:
         type: string
         default: '.github/security-exceptions.yml'
+      tooling-ref:
+        description: >-
+          Ref of Gradient-DS/.github to take the helper scripts from. Defaults to
+          the release tag; override to test a paired workflow + helper change on a
+          branch, or to keep the helper in step with a caller pinned at @main.
+        type: string
+        default: 'v1'
 
 jobs:
   scan:
     name: Container Scan (Trivy)
     runs-on: ubuntu-latest
+    # Least privilege: this job builds a PR-authored Dockerfile, so the only
+    # thing the token may do is read the sources being scanned.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/checkout@v6
         with:
           repository: Gradient-DS/.github
-          ref: v1
+          ref: ${{ inputs.tooling-ref }}
           path: .security-tooling
 
       - uses: actions/setup-python@v6
@@ -41,13 +52,16 @@ jobs:
           python-version: '3.12'
       - run: pip install pyyaml
 
-      - name: Generate .trivyignore from exceptions
+      - name: Generate ignore file from exceptions
         env:
           EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+          # Written outside the workspace: `.trivyignore` at the repo root would
+          # silently overwrite a caller-owned file of that name.
+          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
         run: |
           python .security-tooling/scripts/security_exceptions.py \
             --file "$EXCEPTIONS_FILE" \
-            --check-expiry --emit-trivyignore .trivyignore
+            --check-expiry --emit-trivyignore "$TRIVYIGNORE_PATH"
 
       - name: Maximize build space
         # SHA-pinned, not tag-pinned: this is the suite's only non-mainstream
@@ -80,4 +94,4 @@ jobs:
           severity: 'CRITICAL,HIGH'
           exit-code: '1'
           ignore-unfixed: true
-          trivyignores: '.trivyignore'
+          trivyignores: '${{ runner.temp }}/security-exceptions.trivyignore'
