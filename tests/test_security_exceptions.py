@@ -2,7 +2,8 @@ import datetime as dt
 import pytest
 from scripts.security_exceptions import (
     ExceptionFileError, NpmAuditError, SecurityException, load,
-    expired, main, npm_unexcepted, pip_audit_args, trivyignore_text,
+    expired, gitleaksignore_text, main, npm_unexcepted, pip_audit_args,
+    trivyignore_text,
 )
 
 VALID_ENTRY = """
@@ -196,6 +197,24 @@ def test_exception_id_with_newline_is_rejected(tmp_path):
         load(_write(tmp_path, text))
 
 
+def test_exception_id_with_trailing_newline_only_is_rejected(tmp_path):
+    """Regression test for the match->fullmatch fix.
+
+    `$` without re.MULTILINE matches both at the true end of string AND just
+    before a trailing newline at the end of the string. An id that is
+    otherwise valid, followed by a single trailing "\\n" and nothing else,
+    is the one shape that `ID_PATTERN.match()` would have let through even
+    though `ID_PATTERN.fullmatch()` rejects it — the two existing newline
+    tests above append content *after* the newline, which `.match()` already
+    caught, so neither exercises this quirk.
+    """
+    text = VALID_ENTRY.replace(
+        "id: PYSEC-2026-3412", 'id: "GHSA-a\\n"'
+    )
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
 @pytest.mark.parametrize("bad", ["GHSA a", "GHSA-a;rm -rf /", "GHSA-$(id)", "GHSA-a>out"])
 def test_exception_ids_with_shell_metacharacters_are_rejected(tmp_path, bad):
     text = VALID_ENTRY.replace("id: PYSEC-2026-3412", f'id: "{bad}"')
@@ -212,4 +231,80 @@ def test_trivyignore_text_excludes_other_scanners():
     ])
     assert "CVE-1" in text
     assert "PYSEC-2026-3412" not in text
+    assert "GHSA-aaa" not in text
+
+
+GITLEAKS_FINGERPRINT = (
+    "ba0a0dcd23d3a8b864fe258686e77422db7397d4:infrastructure/README.md:"
+    "curl-auth-header:70"
+)
+
+
+def test_gitleaks_entry_with_fingerprint_id_is_accepted(tmp_path):
+    text = VALID_ENTRY.replace("scanner: pip-audit", "scanner: gitleaks")
+    text = text.replace("id: PYSEC-2026-3412", f"id: {GITLEAKS_FINGERPRINT}")
+    (exc,) = load(_write(tmp_path, text))
+    assert exc.id == GITLEAKS_FINGERPRINT
+    assert exc.scanner == "gitleaks"
+
+
+def test_gitleaks_fingerprint_id_is_rejected_for_pip_audit_scanner(tmp_path):
+    """Proves the strict ID_PATTERN still applies to scanners other than
+    gitleaks: a gitleaks-shaped id (colons, slashes) is not a valid pip-audit
+    id even though it would be fine for gitleaks itself."""
+    text = VALID_ENTRY.replace("id: PYSEC-2026-3412", f"id: {GITLEAKS_FINGERPRINT}")
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
+def test_gitleaks_id_with_newline_is_rejected(tmp_path):
+    text = VALID_ENTRY.replace("scanner: pip-audit", "scanner: gitleaks")
+    text = text.replace(
+        "id: PYSEC-2026-3412", 'id: "abc:def:rule:1\\nEVIL=1"'
+    )
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
+def test_gitleaks_id_with_space_is_rejected(tmp_path):
+    text = VALID_ENTRY.replace("scanner: pip-audit", "scanner: gitleaks")
+    text = text.replace(
+        "id: PYSEC-2026-3412", 'id: "abc:def:rule id:1"'
+    )
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
+def test_gitleaks_id_with_trailing_newline_only_is_rejected(tmp_path):
+    """Same regression as test_exception_id_with_trailing_newline_only_is_
+    rejected, but for GITLEAKS_ID_PATTERN (`^\\S+$`): a fingerprint followed
+    by a single trailing "\\n" and nothing else is exactly the shape
+    `.match()` would wrongly accept and `.fullmatch()` correctly rejects.
+    """
+    text = VALID_ENTRY.replace("scanner: pip-audit", "scanner: gitleaks")
+    text = text.replace(
+        "id: PYSEC-2026-3412", 'id: "abc:def:rule:1\\n"'
+    )
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+
+def test_gitleaksignore_text_lists_ids_with_comments():
+    text = gitleaksignore_text([_exc(GITLEAKS_FINGERPRINT, scanner="gitleaks")])
+    assert GITLEAKS_FINGERPRINT in text
+    assert "pkg" in text
+
+
+def test_gitleaksignore_text_excludes_other_scanners():
+    """Negative isolation: exceptions for other scanners must never reach
+    the gitleaksignore file."""
+    text = gitleaksignore_text([
+        _exc(GITLEAKS_FINGERPRINT, scanner="gitleaks"),
+        _exc("PYSEC-2026-3412", scanner="pip-audit"),
+        _exc("CVE-1", scanner="trivy"),
+        _exc("GHSA-aaa", scanner="npm"),
+    ])
+    assert GITLEAKS_FINGERPRINT in text
+    assert "PYSEC-2026-3412" not in text
+    assert "CVE-1" not in text
     assert "GHSA-aaa" not in text
