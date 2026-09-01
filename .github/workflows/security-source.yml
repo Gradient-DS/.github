@@ -1,0 +1,117 @@
+name: Security Scanning (source)
+
+on:
+  workflow_call:
+    inputs:
+      python-paths:
+        description: 'Space-separated dirs for Bandit. Empty disables the job.'
+        type: string
+        default: ''
+      python-requirements:
+        description: 'Space-separated requirements files for pip-audit. Ignored when python-uv is true.'
+        type: string
+        default: ''
+      python-uv:
+        description: 'Audit the uv lockfile via `uv export` instead of requirements files.'
+        type: boolean
+        default: false
+      node-dirs:
+        description: 'Space-separated dirs holding a package-lock.json. Empty disables the job.'
+        type: string
+        default: ''
+      trivy-config-paths:
+        description: 'Space-separated dirs for `trivy config` (IaC). Empty disables the job.'
+        type: string
+        default: ''
+      exceptions-file:
+        description: 'Path to the per-repo exception file, relative to the caller repo root.'
+        type: string
+        default: '.github/security-exceptions.yml'
+
+env:
+  TOOLING_PATH: .security-tooling
+
+jobs:
+  exceptions:
+    name: Exception file valid and unexpired
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: v1
+          path: ${{ env.TOOLING_PATH }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - name: Validate schema and fail on expired entries
+        run: |
+          python ${{ env.TOOLING_PATH }}/scripts/security_exceptions.py \
+            --file '${{ inputs.exceptions-file }}' --check-expiry
+
+  sast-python:
+    name: Python SAST (Bandit)
+    if: inputs.python-paths != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install bandit
+      - name: Run Bandit
+        run: |
+          bandit -r ${{ inputs.python-paths }} -ll --confidence-level=medium \
+            -x '*/node_modules/*,*/.venv/*,*/dist/*,*/.worktrees/*,*/.wt-*,*/tests/*'
+
+  sca-python:
+    name: Python Dependencies (pip-audit)
+    if: inputs.python-requirements != '' || inputs.python-uv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check out shared tooling
+        uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: v1
+          path: ${{ env.TOOLING_PATH }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - run: pip install pip-audit pyyaml
+
+      - name: Collect ignore arguments
+        id: ignores
+        run: |
+          ARGS=$(python ${{ env.TOOLING_PATH }}/scripts/security_exceptions.py \
+                   --file '${{ inputs.exceptions-file }}' --emit-args)
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        if: inputs.python-uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: '3.12'
+
+      - name: Audit uv lockfile
+        if: inputs.python-uv
+        run: |
+          uv export --format requirements-txt --no-emit-project \
+            --no-hashes --all-extras --no-dev > /tmp/uv-reqs.txt
+          pip-audit --desc on -r /tmp/uv-reqs.txt ${{ steps.ignores.outputs.args }}
+
+      - name: Audit requirements files
+        if: '!inputs.python-uv'
+        run: |
+          for f in ${{ inputs.python-requirements }}; do
+            echo "::group::pip-audit $f"
+            pip-audit --desc on -r "$f" ${{ steps.ignores.outputs.args }}
+            echo "::endgroup::"
+          done
