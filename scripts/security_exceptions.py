@@ -20,7 +20,7 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "id", "package", "scanner", "reason",
     "replacement_considered", "usage_analysis", "approved_by", "recheck",
 )
-VALID_SCANNERS: tuple[str, ...] = ("pip-audit", "trivy", "npm")
+VALID_SCANNERS: tuple[str, ...] = ("pip-audit", "trivy", "npm", "gitleaks")
 NPM_BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 
 # Exception ids are interpolated into scanner command lines and into
@@ -28,6 +28,15 @@ NPM_BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 # would let a PR inject extra step outputs or extra arguments, so the id is
 # restricted to the character set every real advisory id already uses.
 ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# gitleaks ids are fingerprints of the form <commit-sha>:<file-path>:<rule-id>:
+# <line>, e.g. ba0a0d...4d:infrastructure/README.md:curl-auth-header:70 — they
+# legitimately contain ':' and '/', so ID_PATTERN is too strict for them. This
+# relaxed pattern is safe only because gitleaks ids are written to a
+# .gitleaksignore file and are never interpolated into a shell argument or
+# into $GITHUB_OUTPUT; it still forbids any whitespace, including newlines and
+# tabs, so an id can never inject an extra line into that file.
+GITLEAKS_ID_PATTERN = re.compile(r"^\S+$")
 
 # Reported npm findings that carry no resolvable advisory id are labelled with
 # this prefix so a package name is never mistaken for an advisory id.
@@ -80,10 +89,23 @@ def load(path: str | Path) -> list[SecurityException]:
                 f"{path}: entry {i} field 'recheck' must be a YAML date "
                 f"(YYYY-MM-DD), got {entry['recheck']!r}"
             )
-        if not ID_PATTERN.match(str(entry["id"])):
+        # Each id is validated against the pattern for ITS OWN scanner.
+        # gitleaks fingerprints legitimately contain ':' and '/', which
+        # ID_PATTERN forbids, so gitleaks gets its own, wider pattern — never
+        # the other way around. `fullmatch` (not `match`) is deliberate: `$`
+        # without MULTILINE matches just before a trailing newline as well as
+        # at the true end of string, so `match` alone would let an id ending
+        # in "\n" slip through both patterns.
+        if entry["scanner"] == "gitleaks":
+            id_pattern = GITLEAKS_ID_PATTERN
+            id_pattern_desc = "no whitespace"
+        else:
+            id_pattern = ID_PATTERN
+            id_pattern_desc = "letters, digits, dot, underscore, hyphen"
+        if not id_pattern.fullmatch(str(entry["id"])):
             raise ExceptionFileError(
                 f"{path}: entry {i} has invalid id {entry['id']!r}; ids must match "
-                f"{ID_PATTERN.pattern} (letters, digits, dot, underscore, hyphen)"
+                f"{id_pattern.pattern} ({id_pattern_desc})"
             )
         if entry["id"] in seen:
             raise ExceptionFileError(f"{path}: duplicate exception id {entry['id']!r}")
@@ -119,6 +141,15 @@ def trivyignore_text(excs: list[SecurityException]) -> str:
     lines = ["# Generated from .github/security-exceptions.yml — do not edit by hand."]
     for e in excs:
         if e.scanner == "trivy":
+            lines.append(f"# {e.package}: {e.reason} (approved by {e.approved_by}, recheck {e.recheck})")
+            lines.append(e.id)
+    return "\n".join(lines) + "\n"
+
+
+def gitleaksignore_text(excs: list[SecurityException]) -> str:
+    lines = ["# Generated from .github/security-exceptions.yml — do not edit by hand."]
+    for e in excs:
+        if e.scanner == "gitleaks":
             lines.append(f"# {e.package}: {e.reason} (approved by {e.approved_by}, recheck {e.recheck})")
             lines.append(e.id)
     return "\n".join(lines) + "\n"
@@ -180,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--file", required=True)
     ap.add_argument("--emit-args", action="store_true")
     ap.add_argument("--emit-trivyignore")
+    ap.add_argument("--emit-gitleaksignore")
     ap.add_argument("--check-expiry", action="store_true")
     ap.add_argument("--npm-audit-json")
     args = ap.parse_args(argv)
@@ -207,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.emit_trivyignore:
         Path(args.emit_trivyignore).write_text(trivyignore_text(excs))
+
+    if args.emit_gitleaksignore:
+        Path(args.emit_gitleaksignore).write_text(gitleaksignore_text(excs))
 
     if args.npm_audit_json:
         try:
