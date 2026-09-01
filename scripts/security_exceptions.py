@@ -6,7 +6,10 @@ reviewer has confirmed the vulnerable path is unreachable in our usage.
 """
 from __future__ import annotations
 
+import argparse
 import datetime as dt
+import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +20,7 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "replacement_considered", "usage_analysis", "approved_by", "recheck",
 )
 VALID_SCANNERS: tuple[str, ...] = ("pip-audit", "trivy", "npm")
+NPM_BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 
 
 class ExceptionFileError(ValueError):
@@ -76,13 +80,6 @@ def load(path: str | Path) -> list[SecurityException]:
             recheck=entry["recheck"],
         ))
     return out
-
-
-import argparse
-import json
-import sys
-
-NPM_BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 
 
 def expired(excs: list[SecurityException], today: dt.date) -> list[SecurityException]:

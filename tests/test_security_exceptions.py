@@ -122,3 +122,14 @@ def test_npm_unexcepted_respects_exceptions():
         "lodash": {"severity": "critical", "via": [{"url": "https://github.com/advisories/GHSA-aaa"}]},
     }}
     assert npm_unexcepted(audit, [_exc("GHSA-aaa", scanner="npm")]) == []
+
+
+def test_npm_unexcepted_handles_mixed_via_shapes():
+    audit = {"vulnerabilities": {
+        "lodash": {"severity": "critical", "via": [
+            "some-transitive-pkg",
+            {"url": "https://github.com/advisories/GHSA-aaa"},
+        ]},
+        "only-string-via": {"severity": "high", "via": ["lodash"]},
+    }}
+    assert npm_unexcepted(audit, []) == ["GHSA-aaa"]
