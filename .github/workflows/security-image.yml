@@ -1,0 +1,97 @@
+name: Security Scanning (image)
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: 'Docker build context, e.g. ./server'
+        type: string
+        required: true
+      dockerfile:
+        description: 'Dockerfile path relative to the repo root.'
+        type: string
+        required: true
+      image-name:
+        description: 'Local tag for the built image; appears in scan output.'
+        type: string
+        required: true
+      build-args:
+        description: 'Newline-separated KEY=VALUE build args.'
+        type: string
+        default: ''
+      exceptions-file:
+        type: string
+        default: '.github/security-exceptions.yml'
+      tooling-ref:
+        description: >-
+          Ref of Gradient-DS/.github to take the helper scripts from. Defaults to
+          the release tag; override to test a paired workflow + helper change on a
+          branch, or to keep the helper in step with a caller pinned at @main.
+        type: string
+        default: 'v1'
+
+jobs:
+  scan:
+    name: Container Scan (Trivy)
+    runs-on: ubuntu-latest
+    # Least privilege: this job builds a PR-authored Dockerfile, so the only
+    # thing the token may do is read the sources being scanned.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: ${{ inputs.tooling-ref }}
+          path: .security-tooling
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+
+      - name: Generate ignore file from exceptions
+        env:
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+          # Written outside the workspace: `.trivyignore` at the repo root would
+          # silently overwrite a caller-owned file of that name.
+          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
+        run: |
+          python .security-tooling/scripts/security_exceptions.py \
+            --file "$EXCEPTIONS_FILE" \
+            --check-expiry --emit-trivyignore "$TRIVYIGNORE_PATH"
+
+      - name: Maximize build space
+        # SHA-pinned, not tag-pinned: this is the suite's only non-mainstream
+        # third-party action and a mutable tag would let a retag execute
+        # arbitrary code inside a security gate across nine repos.
+        uses: AdityaGarg8/remove-unwanted-software@8831c82abf29b34eb2caac48d5f999ecfc0d8eef # v4.1
+        with:
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          push: false
+          tags: ${{ inputs.image-name }}:scan
+          build-args: ${{ inputs.build-args }}
+          cache-from: type=gha
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: '${{ inputs.image-name }}:scan'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+          trivyignores: '${{ runner.temp }}/security-exceptions.trivyignore'

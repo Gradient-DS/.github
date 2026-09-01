@@ -1,0 +1,355 @@
+name: Security Scanning (source)
+
+on:
+  workflow_call:
+    inputs:
+      python-paths:
+        description: 'Space-separated dirs for Bandit. Empty disables the job.'
+        type: string
+        default: ''
+      python-requirements:
+        description: 'Space-separated requirements files for pip-audit. Ignored when python-uv is true.'
+        type: string
+        default: ''
+      python-uv:
+        description: 'Audit the uv lockfile via `uv export` instead of requirements files.'
+        type: boolean
+        default: false
+      node-dirs:
+        description: 'Space-separated dirs holding a package-lock.json. Empty disables the job.'
+        type: string
+        default: ''
+      trivy-config-paths:
+        description: 'Space-separated dirs for `trivy config` (IaC). Empty disables the job.'
+        type: string
+        default: ''
+      exceptions-file:
+        description: 'Path to the per-repo exception file, relative to the caller repo root.'
+        type: string
+        default: '.github/security-exceptions.yml'
+      tooling-ref:
+        description: >-
+          Ref of Gradient-DS/.github to take the helper scripts from. Defaults to
+          the release tag; override to test a paired workflow + helper change on a
+          branch, or to keep the helper in step with a caller pinned at @main.
+        type: string
+        default: 'v1'
+
+env:
+  TOOLING_PATH: .security-tooling
+
+jobs:
+  exceptions:
+    name: Exception file valid and unexpired
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: ${{ inputs.tooling-ref }}
+          path: ${{ env.TOOLING_PATH }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - name: Validate schema and fail on expired entries
+        env:
+          TOOLING_PATH: ${{ env.TOOLING_PATH }}
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+        run: |
+          python "$TOOLING_PATH"/scripts/security_exceptions.py \
+            --file "$EXCEPTIONS_FILE" --check-expiry
+
+  sast-python:
+    name: Python SAST (Bandit)
+    if: inputs.python-paths != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install bandit
+      - name: Run Bandit
+        env:
+          PYTHON_PATHS: ${{ inputs.python-paths }}
+        run: |
+          # shellcheck disable=SC2086
+          bandit -r $PYTHON_PATHS -ll --confidence-level=medium \
+            -x '*/node_modules/*,*/.venv/*,*/dist/*,*/.worktrees/*,*/.wt-*,*/tests/*'
+
+  sca-python:
+    name: Python Dependencies (pip-audit)
+    if: inputs.python-requirements != '' || inputs.python-uv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check out shared tooling
+        uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: ${{ inputs.tooling-ref }}
+          path: ${{ env.TOOLING_PATH }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - run: pip install pip-audit pyyaml
+
+      - name: Collect ignore arguments
+        id: ignores
+        env:
+          TOOLING_PATH: ${{ env.TOOLING_PATH }}
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+        run: |
+          ARGS=$(python "$TOOLING_PATH"/scripts/security_exceptions.py \
+                   --file "$EXCEPTIONS_FILE" --emit-args)
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        if: inputs.python-uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: '3.12'
+
+      - name: Audit uv lockfile
+        if: inputs.python-uv
+        env:
+          PIP_AUDIT_ARGS: ${{ steps.ignores.outputs.args }}
+        run: |
+          uv export --format requirements-txt --no-emit-project \
+            --no-hashes --all-extras --no-dev > /tmp/uv-reqs.txt
+          # shellcheck disable=SC2086
+          pip-audit --desc on -r /tmp/uv-reqs.txt $PIP_AUDIT_ARGS
+
+      - name: Audit requirements files
+        if: '!inputs.python-uv'
+        env:
+          PYTHON_REQS: ${{ inputs.python-requirements }}
+          PIP_AUDIT_ARGS: ${{ steps.ignores.outputs.args }}
+        run: |
+          # shellcheck disable=SC2086
+          for f in $PYTHON_REQS; do
+            echo "::group::pip-audit $f"
+            pip-audit --desc on -r "$f" $PIP_AUDIT_ARGS
+            echo "::endgroup::"
+          done
+
+  sca-node:
+    name: Node Dependencies (npm audit)
+    if: inputs.node-dirs != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: ${{ inputs.tooling-ref }}
+          path: ${{ env.TOOLING_PATH }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - name: Audit each Node directory
+        env:
+          # Values reach the shell through env, never interpolated into the
+          # script text: a `${{ }}` substitution happens BEFORE the shell parses
+          # the line, so metacharacters in a value would execute. NODE_DIRS is
+          # expanded unquoted on purpose — word-splitting is wanted, command
+          # substitution is not, and expansion results are never re-evaluated.
+          NODE_DIRS: ${{ inputs.node-dirs }}
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+          TOOLING: ${{ env.TOOLING_PATH }}
+        run: |
+          # pipefail is safe alongside the deliberate `|| true` below: that
+          # `|| true` covers a plain command group, not a pipeline, so npm's
+          # non-zero exit on findings is still ignored while a genuine npm
+          # failure is caught downstream — npm writes {"error": {...}} instead
+          # of a `vulnerabilities` report, and the helper fails closed on that.
+          set -o pipefail
+
+          for d in $NODE_DIRS; do
+            echo "::group::npm audit $d"
+            AUDIT_JSON="$(mktemp)"
+            ( cd "$d" && npm ci --ignore-scripts ) || {
+              echo "::error::npm ci failed in $d — cannot audit, failing closed"
+              rm -f "$AUDIT_JSON"
+              exit 1
+            }
+            ( cd "$d" && npm audit --json ) > "$AUDIT_JSON" || true
+            python "$TOOLING/scripts/security_exceptions.py" \
+              --file "$EXCEPTIONS_FILE" \
+              --npm-audit-json "$AUDIT_JSON"
+            rm -f "$AUDIT_JSON"
+            echo "::endgroup::"
+          done
+
+  secrets:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0    # gitleaks scans full history, not just the tip
+      - name: Install gitleaks
+        env:
+          GITLEAKS_TAG: v8.30.1
+        run: |
+          # pipefail: the default shell is `bash -e {0}`, so without this a
+          # failing curl in `curl | tar` is masked by tar's exit status.
+          set -euo pipefail
+
+          VERSION="${GITLEAKS_TAG#v}"
+          BASE="https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_TAG}"
+          TARBALL="gitleaks_${VERSION}_linux_x64.tar.gz"
+          WORK="$(mktemp -d)"
+
+          # Download, then verify against the checksums file published with the
+          # release, then extract. `gitleaks version` only catches a truncated
+          # download; it cannot detect a substituted binary.
+          curl -sSfL -o "$WORK/$TARBALL" "$BASE/$TARBALL"
+          curl -sSfL -o "$WORK/checksums.txt" "$BASE/gitleaks_${VERSION}_checksums.txt"
+
+          ( cd "$WORK" && grep " ${TARBALL}\$" checksums.txt | sha256sum -c - ) || {
+            echo "::error::gitleaks ${GITLEAKS_TAG} checksum verification failed — refusing to run an unverified binary"
+            exit 1
+          }
+
+          tar -xzf "$WORK/$TARBALL" -C /usr/local/bin gitleaks
+          rm -rf "$WORK"
+          gitleaks version
+      - name: Scan history
+        run: gitleaks git . --redact --exit-code 1 --verbose
+
+  iac:
+    name: IaC (trivy config)
+    if: inputs.trivy-config-paths != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: ${{ inputs.tooling-ref }}
+          path: ${{ env.TOOLING_PATH }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      - name: Generate ignore file from exceptions
+        env:
+          EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
+          TOOLING: ${{ env.TOOLING_PATH }}
+          # Written outside the workspace: `.trivyignore` at the repo root would
+          # silently overwrite a caller-owned file of that name.
+          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
+        run: |
+          python "$TOOLING/scripts/security_exceptions.py" \
+            --file "$EXCEPTIONS_FILE" \
+            --emit-trivyignore "$TRIVYIGNORE_PATH"
+
+      # `trivy config` takes exactly one target, but trivy-config-paths is
+      # documented as space-separated and one repo needs four roots. The action
+      # cannot be run a variable number of times, so install the same pinned
+      # trivy the action would install (trivy-action@v0.36.0 ships v0.70.0) and
+      # loop the CLI.
+      - name: Install trivy
+        uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: v0.70.0
+          cache: true
+
+      - name: Run trivy config on each path
+        env:
+          # Unquoted expansion below is deliberate: word-splitting is wanted,
+          # command substitution is not.
+          TRIVY_CONFIG_PATHS: ${{ inputs.trivy-config-paths }}
+          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
+        run: |
+          set -uo pipefail
+
+          # Every path is scanned even after one fails, so a single run reports
+          # every offending root; the accumulator makes sure a later clean path
+          # cannot mask an earlier failure.
+          rc=0
+          # shellcheck disable=SC2086
+          for p in $TRIVY_CONFIG_PATHS; do
+            echo "::group::trivy config $p"
+            if [ ! -e "$p" ]; then
+              echo "::error::trivy config path '$p' does not exist — failing closed rather than reporting a clean scan"
+              rc=1
+              echo "::endgroup::"
+              continue
+            fi
+            trivy config "$p" \
+              --severity CRITICAL,HIGH \
+              --exit-code 1 \
+              --ignorefile "$TRIVYIGNORE_PATH" || rc=1
+            echo "::endgroup::"
+          done
+          exit "$rc"
+
+  notify-scheduled-failure:
+    name: Notify on scheduled failure
+    needs: [exceptions, sast-python, sca-python, sca-node, secrets, iac]
+    if: always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      # `issues: write` alone drops the implicit `contents: read`, which the two
+      # checkout steps below need.
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: Gradient-DS/.github
+          ref: ${{ inputs.tooling-ref }}
+          path: .security-tooling
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NEEDS_JSON: ${{ toJson(needs) }}
+          TOOLING: .security-tooling
+        run: |
+          # pipefail: without it a failing `printf`/`gh` in the pipelines below
+          # is masked by jq's exit status, and the notifier would act on an
+          # empty job list or an empty issue list.
+          set -o pipefail
+
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          FAILED_JOBS=$(printf '%s' "$NEEDS_JSON" \
+            | jq -r 'to_entries | map(select(.value.result == "failure") | .key) | join(",")')
+          export REPO_NAME FAILED_JOBS
+
+          python -c 'import os,sys; sys.path.insert(0,os.environ["TOOLING"]); from scripts.notify_scheduled_failure import issue_title; print(issue_title(os.environ["REPO_NAME"]),end="")' > /tmp/issue-title.txt
+          python -c 'import os,sys; sys.path.insert(0,os.environ["TOOLING"]); from scripts.notify_scheduled_failure import issue_body; failed=[j for j in os.environ["FAILED_JOBS"].split(",") if j]; print(issue_body(os.environ["REPO_NAME"],os.environ["RUN_URL"],failed),end="")' > /tmp/issue-body.md
+
+          TITLE=$(cat /tmp/issue-title.txt)
+
+          # Idempotent: `gh label create` exits non-zero if the label already
+          # exists, which is fine. Without this the notifier dies on any repo
+          # that has never had a `security` label.
+          gh label create security --color B60205 \
+            --description "Automated security scan findings" 2>/dev/null || true
+
+          # Exact title match via jq — `gh issue list --search` is fuzzy
+          # full-text and can match an unrelated issue or miss the real one.
+          EXISTING=$(gh issue list --state open --label security --json number,title \
+            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | .[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file /tmp/issue-body.md
+          else
+            gh issue create --title "$TITLE" --body-file /tmp/issue-body.md --label security
+          fi

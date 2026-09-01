@@ -1,0 +1,13 @@
+[project]
+name = "gradient-ci-tooling"
+version = "1.0.0"
+description = "Helper scripts for Gradient-DS reusable security workflows"
+requires-python = ">=3.12"
+dependencies = ["PyYAML>=6.0.2"]
+
+[dependency-groups]
+dev = ["pytest>=8.3.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
