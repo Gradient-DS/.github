@@ -46,7 +46,7 @@ def load(path: str | Path) -> list[SecurityException]:
     out: list[SecurityException] = []
     seen: set[str] = set()
     for i, entry in enumerate(entries):
-        missing = [f for f in REQUIRED_FIELDS if not entry.get(f)]
+        missing = [f for f in REQUIRED_FIELDS if not str(entry.get(f, "")).strip()]
         if missing:
             raise ExceptionFileError(
                 f"{path}: entry {i} is missing required field(s): {', '.join(missing)}"

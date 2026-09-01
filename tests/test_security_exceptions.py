@@ -59,3 +59,16 @@ def test_non_date_recheck_is_rejected(tmp_path):
     text = VALID_ENTRY.replace("recheck: 2026-12-01", 'recheck: "soon"')
     with pytest.raises(ExceptionFileError, match="recheck"):
         load(_write(tmp_path, text))
+
+def test_whitespace_only_required_field_is_rejected(tmp_path):
+    text = VALID_ENTRY.replace(
+        "    usage_analysis: >-\n", "    usage_analysis: '   '\n"
+    )
+    # collapse the now-orphaned continuation lines of the folded block
+    text = "\n".join(
+        l for l in text.split("\n")
+        if not l.startswith("      The advisory needs")
+        and not l.startswith("      server-side templates")
+    )
+    with pytest.raises(ExceptionFileError, match="usage_analysis"):
+        load(_write(tmp_path, text))
