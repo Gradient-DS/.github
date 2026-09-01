@@ -246,17 +246,32 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NEEDS_JSON: ${{ toJson(needs) }}
+          TOOLING: .security-tooling
         run: |
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
-          TITLE=$(python -c "import sys; sys.path.insert(0,'.security-tooling'); \
-            from scripts.notify_scheduled_failure import issue_title; print(issue_title('$REPO_NAME'))")
-          BODY=$(python -c "import sys; sys.path.insert(0,'.security-tooling'); \
-            from scripts.notify_scheduled_failure import issue_body; \
-            print(issue_body('$REPO_NAME', '$RUN_URL', []))")
-          EXISTING=$(gh issue list --state open --label security \
-                       --search "$TITLE" --json number --jq '.[0].number // empty')
+          FAILED_JOBS=$(printf '%s' "$NEEDS_JSON" \
+            | jq -r 'to_entries | map(select(.value.result == "failure") | .key) | join(",")')
+          export REPO_NAME FAILED_JOBS
+
+          python -c 'import os,sys; sys.path.insert(0,os.environ["TOOLING"]); from scripts.notify_scheduled_failure import issue_title; print(issue_title(os.environ["REPO_NAME"]),end="")' > /tmp/issue-title.txt
+          python -c 'import os,sys; sys.path.insert(0,os.environ["TOOLING"]); from scripts.notify_scheduled_failure import issue_body; failed=[j for j in os.environ["FAILED_JOBS"].split(",") if j]; print(issue_body(os.environ["REPO_NAME"],os.environ["RUN_URL"],failed),end="")' > /tmp/issue-body.md
+
+          TITLE=$(cat /tmp/issue-title.txt)
+
+          # Idempotent: `gh label create` exits non-zero if the label already
+          # exists, which is fine. Without this the notifier dies on any repo
+          # that has never had a `security` label.
+          gh label create security --color B60205 \
+            --description "Automated security scan findings" 2>/dev/null || true
+
+          # Exact title match via jq — `gh issue list --search` is fuzzy
+          # full-text and can match an unrelated issue or miss the real one.
+          EXISTING=$(gh issue list --state open --label security --json number,title \
+            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | .[0].number // empty')
+
           if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --body "$BODY"
+            gh issue comment "$EXISTING" --body-file /tmp/issue-body.md
           else
-            gh issue create --title "$TITLE" --body "$BODY" --label security
+            gh issue create --title "$TITLE" --body-file /tmp/issue-body.md --label security
           fi
