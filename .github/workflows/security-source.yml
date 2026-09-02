@@ -279,16 +279,24 @@ jobs:
           python-version: '3.12'
       - run: pip install pyyaml
       - name: Generate ignore file from exceptions
+        id: trivyignore
         env:
           EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
           TOOLING: ${{ env.TOOLING_PATH }}
           # Written outside the workspace: `.trivyignore` at the repo root would
           # silently overwrite a caller-owned file of that name.
-          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
+          TRIVYIGNORE_BASE: ${{ runner.temp }}/security-exceptions.trivyignore
         run: |
-          python "$TOOLING/scripts/security_exceptions.py" \
-            --file "$EXCEPTIONS_FILE" \
-            --emit-trivyignore "$TRIVYIGNORE_PATH"
+          # The helper chooses the file FORMAT and therefore the file NAME:
+          # trivy's plain one-id-per-line format at $TRIVYIGNORE_BASE when no
+          # exception is path-scoped, and trivy's YAML format at
+          # "$TRIVYIGNORE_BASE.yaml" when one is -- trivy selects its parser by
+          # extension. It prints the path it wrote, and that is the only thing
+          # it prints, so capturing stdout is the contract.
+          FILE=$(python "$TOOLING/scripts/security_exceptions.py" \
+                   --file "$EXCEPTIONS_FILE" \
+                   --emit-trivyignore "$TRIVYIGNORE_BASE")
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
 
       # `trivy config` takes exactly one target, but trivy-config-paths is
       # documented as space-separated and one repo needs four roots. The action
@@ -306,7 +314,9 @@ jobs:
           # Unquoted expansion below is deliberate: word-splitting is wanted,
           # command substitution is not.
           TRIVY_CONFIG_PATHS: ${{ inputs.trivy-config-paths }}
-          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
+          # Whichever format the previous step emitted. Passed through env, not
+          # interpolated into the script text, like every other value here.
+          TRIVYIGNORE_PATH: ${{ steps.trivyignore.outputs.file }}
         run: |
           set -uo pipefail
 

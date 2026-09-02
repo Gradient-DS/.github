@@ -1,9 +1,10 @@
 import datetime as dt
+import pathlib
 import pytest
 from scripts.security_exceptions import (
     ExceptionFileError, NpmAuditError, SecurityException, load,
     expired, gitleaksignore_text, main, npm_unexcepted, pip_audit_args,
-    trivyignore_text,
+    trivyignore_text, trivyignore_yaml_text, write_trivyignore,
 )
 
 VALID_ENTRY = """
@@ -308,3 +309,189 @@ def test_gitleaksignore_text_excludes_other_scanners():
     assert "PYSEC-2026-3412" not in text
     assert "CVE-1" not in text
     assert "GHSA-aaa" not in text
+
+
+# --------------------------------------------------------------------------
+# Optional `paths`: per-file scoping for trivy exceptions.
+#
+# The problem it solves: a plain `.trivyignore` matches by check id across the
+# whole scanned tree, so an exception written for four known privileged
+# DaemonSets silently covers a fifth one added next month. These tests pin the
+# validation, the format switch, and — most importantly — that an unscoped
+# entry still behaves exactly as it did before the field existed.
+# --------------------------------------------------------------------------
+import yaml as _yaml
+
+TRIVY_ENTRY = """
+version: 1
+exceptions:
+  - id: KSV017
+    package: infrastructure
+    scanner: trivy
+    reason: The node-tuning DaemonSets configure the host and must be privileged.
+    replacement_considered: Capability narrowing is privileged in all but name.
+    usage_analysis: Pinned busybox, fixed inline scripts, no external input.
+    approved_by: "@some-reviewer"
+    recheck: 2026-12-01
+"""
+
+SCOPED_PATHS = """    paths:
+      - "previder-prod/node-tuning/iscsi-node-seed-daemonset.yaml"
+      - "previder-prod/node-tuning/inotify-daemonset.yaml"
+"""
+
+
+def _scoped(extra=SCOPED_PATHS):
+    return TRIVY_ENTRY.replace("    recheck: 2026-12-01\n",
+                               "    recheck: 2026-12-01\n" + extra)
+
+
+def test_paths_is_optional_and_defaults_to_tree_wide(tmp_path):
+    (exc,) = load(_write(tmp_path, TRIVY_ENTRY))
+    assert exc.paths == ()
+
+
+def test_paths_is_parsed_into_a_tuple(tmp_path):
+    (exc,) = load(_write(tmp_path, _scoped()))
+    assert exc.paths == (
+        "previder-prod/node-tuning/iscsi-node-seed-daemonset.yaml",
+        "previder-prod/node-tuning/inotify-daemonset.yaml",
+    )
+
+
+def test_paths_on_a_non_trivy_scanner_is_rejected(tmp_path):
+    """A `paths` list on a gitleaks or pip-audit entry would read as scoped
+    while actually suppressing tree-wide — the worst possible failure mode for
+    this field, so it is a hard error rather than a silent no-op."""
+    text = _scoped().replace("scanner: trivy", "scanner: pip-audit")
+    with pytest.raises(ExceptionFileError, match="only trivy supports"):
+        load(_write(tmp_path, text))
+
+
+def test_empty_paths_list_is_rejected(tmp_path):
+    text = TRIVY_ENTRY.replace("    recheck: 2026-12-01\n",
+                               "    recheck: 2026-12-01\n    paths: []\n")
+    with pytest.raises(ExceptionFileError, match="non-empty list"):
+        load(_write(tmp_path, text))
+
+
+def test_paths_must_be_a_list_not_a_bare_string(tmp_path):
+    text = TRIVY_ENTRY.replace("    recheck: 2026-12-01\n",
+                               '    recheck: 2026-12-01\n    paths: "a.yaml"\n')
+    with pytest.raises(ExceptionFileError, match="non-empty list"):
+        load(_write(tmp_path, text))
+
+
+@pytest.mark.parametrize("bad", ["/etc/passwd", "../../etc/passwd", "a/../../b.yaml"])
+def test_absolute_and_traversing_paths_are_rejected(tmp_path, bad):
+    text = _scoped(f'    paths:\n      - "{bad}"\n')
+    with pytest.raises(ExceptionFileError, match="relative to the trivy scan root"):
+        load(_write(tmp_path, text))
+
+
+def test_path_with_embedded_newline_is_rejected(tmp_path):
+    text = _scoped('    paths:\n      - "a.yaml\\nb.yaml"\n')
+    with pytest.raises(ExceptionFileError, match="whitespace"):
+        load(_write(tmp_path, text))
+
+
+def test_empty_path_entry_is_rejected(tmp_path):
+    text = _scoped('    paths:\n      - "   "\n')
+    with pytest.raises(ExceptionFileError, match="non-string or empty"):
+        load(_write(tmp_path, text))
+
+
+def test_yaml_ignorefile_carries_paths_per_entry():
+    scoped = SecurityException(
+        id="KSV017", package="infra", scanner="trivy", reason="r",
+        replacement_considered="rc", usage_analysis="ua", approved_by="@r",
+        recheck=dt.date(2026, 12, 1), paths=("a/b.yaml",),
+    )
+    doc = _yaml.safe_load(trivyignore_yaml_text([scoped]))
+    (mis,) = doc["misconfigurations"]
+    assert mis["id"] == "KSV017"
+    assert mis["paths"] == ["a/b.yaml"]
+
+
+def test_yaml_ignorefile_omits_paths_for_tree_wide_entries():
+    doc = _yaml.safe_load(trivyignore_yaml_text([_exc("CVE-1", scanner="trivy")]))
+    (mis,) = doc["misconfigurations"]
+    assert "paths" not in mis
+
+
+def test_yaml_ignorefile_lists_each_id_under_both_kinds():
+    """The plain format is kind-agnostic — one id there suppresses a
+    misconfiguration and a vulnerability alike. Listing the id under both
+    kinds is what keeps the YAML file equivalent rather than narrower."""
+    doc = _yaml.safe_load(trivyignore_yaml_text([_exc("CVE-1", scanner="trivy")]))
+    assert [e["id"] for e in doc["misconfigurations"]] == ["CVE-1"]
+    assert [e["id"] for e in doc["vulnerabilities"]] == ["CVE-1"]
+
+
+def test_yaml_ignorefile_excludes_other_scanners():
+    doc = _yaml.safe_load(trivyignore_yaml_text([
+        _exc("CVE-1", scanner="trivy"),
+        _exc("PYSEC-2026-3412", scanner="pip-audit"),
+        _exc("GHSA-aaa", scanner="npm"),
+    ]))
+    assert [e["id"] for e in doc["misconfigurations"]] == ["CVE-1"]
+    assert [e["id"] for e in doc["vulnerabilities"]] == ["CVE-1"]
+
+
+def test_yaml_statement_is_a_single_line():
+    """A folded `reason` spans several lines; the statement must not, or the
+    generated document changes shape with the wording."""
+    multi = SecurityException(
+        id="KSV017", package="infra", scanner="trivy",
+        reason="first line\nsecond line", replacement_considered="rc",
+        usage_analysis="ua", approved_by="@r", recheck=dt.date(2026, 12, 1),
+    )
+    (mis,) = _yaml.safe_load(trivyignore_yaml_text([multi]))["misconfigurations"]
+    assert "\n" not in mis["statement"]
+    assert "first line second line" in mis["statement"]
+
+
+def test_write_trivyignore_uses_plain_format_when_nothing_is_scoped(tmp_path):
+    """Regression guard for the other eight repos: adding this field must not
+    change the file any repo without `paths` gets."""
+    base = tmp_path / "security-exceptions.trivyignore"
+    written = write_trivyignore([_exc("CVE-1", scanner="trivy")], str(base))
+    assert written == base
+    assert not (tmp_path / "security-exceptions.trivyignore.yaml").exists()
+    assert written.read_text() == trivyignore_text([_exc("CVE-1", scanner="trivy")])
+
+
+def test_write_trivyignore_switches_to_yaml_when_any_entry_is_scoped(tmp_path):
+    """Trivy picks its parser by extension, so the YAML format has to land on
+    a *.yaml path — the switch is a rename, not just a different body."""
+    base = tmp_path / "security-exceptions.trivyignore"
+    scoped = SecurityException(
+        id="KSV017", package="infra", scanner="trivy", reason="r",
+        replacement_considered="rc", usage_analysis="ua", approved_by="@r",
+        recheck=dt.date(2026, 12, 1), paths=("a/b.yaml",),
+    )
+    written = write_trivyignore([scoped, _exc("CVE-1", scanner="trivy")], str(base))
+    assert written.name.endswith(".trivyignore.yaml")
+    assert not base.exists()
+    doc = _yaml.safe_load(written.read_text())
+    assert {e["id"] for e in doc["misconfigurations"]} == {"KSV017", "CVE-1"}
+
+
+def test_cli_prints_the_path_it_wrote(tmp_path, capsys):
+    """The workflows capture stdout to learn which file to hand trivy, so the
+    path must be the only thing on it."""
+    base = tmp_path / "security-exceptions.trivyignore"
+    rc = main(["--file", str(_write(tmp_path, _scoped())),
+               "--emit-trivyignore", str(base)])
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out == f"{base}.yaml"
+    assert _yaml.safe_load(pathlib.Path(out).read_text())["misconfigurations"]
+
+
+def test_cli_prints_plain_path_when_nothing_is_scoped(tmp_path, capsys):
+    base = tmp_path / "security-exceptions.trivyignore"
+    rc = main(["--file", str(_write(tmp_path, TRIVY_ENTRY)),
+               "--emit-trivyignore", str(base)])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == str(base)

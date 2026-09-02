@@ -53,15 +53,22 @@ jobs:
       - run: pip install pyyaml
 
       - name: Generate ignore file from exceptions
+        id: trivyignore
         env:
           EXCEPTIONS_FILE: ${{ inputs.exceptions-file }}
           # Written outside the workspace: `.trivyignore` at the repo root would
           # silently overwrite a caller-owned file of that name.
-          TRIVYIGNORE_PATH: ${{ runner.temp }}/security-exceptions.trivyignore
+          TRIVYIGNORE_BASE: ${{ runner.temp }}/security-exceptions.trivyignore
         run: |
-          python .security-tooling/scripts/security_exceptions.py \
-            --file "$EXCEPTIONS_FILE" \
-            --check-expiry --emit-trivyignore "$TRIVYIGNORE_PATH"
+          # See the same step in security-source.yml: the helper picks the
+          # format (plain, or trivy's path-scoped YAML at "<base>.yaml") and
+          # prints the path it wrote. trivy-action@v0.36.0 accepts either --
+          # it passes a single *.yaml file straight through as
+          # TRIVY_IGNOREFILE, and only concatenates in plain mode.
+          FILE=$(python .security-tooling/scripts/security_exceptions.py \
+                   --file "$EXCEPTIONS_FILE" \
+                   --check-expiry --emit-trivyignore "$TRIVYIGNORE_BASE")
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
 
       - name: Maximize build space
         # SHA-pinned, not tag-pinned: this is the suite's only non-mainstream
@@ -94,4 +101,4 @@ jobs:
           severity: 'CRITICAL,HIGH'
           exit-code: '1'
           ignore-unfixed: true
-          trivyignores: '${{ runner.temp }}/security-exceptions.trivyignore'
+          trivyignores: '${{ steps.trivyignore.outputs.file }}'
