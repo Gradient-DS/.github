@@ -209,6 +209,20 @@ def trivyignore_text(excs: list[SecurityException]) -> str:
     return "\n".join(lines) + "\n"
 
 
+class _NoAliasDumper(yaml.SafeDumper):
+    """SafeDumper that never emits YAML anchors or aliases.
+
+    Each trivy id is written twice (once per kind), so the two entries would
+    otherwise share the same `paths` list object and PyYAML would collapse the
+    second into `paths: *id001`. That is valid YAML and trivy parses it, but a
+    generated file a human reads during an incident should not need the reader
+    to resolve aliases to see which files an exception covers.
+    """
+
+    def ignore_aliases(self, data):  # noqa: D102 - see class docstring
+        return True
+
+
 def _statement(e: SecurityException) -> str:
     """The one-line note trivy echoes next to a suppressed finding.
 
@@ -234,22 +248,28 @@ def trivyignore_yaml_text(excs: list[SecurityException]) -> str:
     fail silently in both directions. An id under the wrong kind simply never
     matches.
     """
+    def _yaml_entry(e: SecurityException) -> dict:
+        # Built fresh per kind, never shared: two dicts pointing at one list
+        # is what makes PyYAML emit an alias.
+        item: dict = {"id": e.id, "statement": _statement(e)}
+        if e.paths:
+            item["paths"] = list(e.paths)
+        return item
+
     misconfigurations: list[dict] = []
     vulnerabilities: list[dict] = []
     for e in excs:
         if e.scanner != "trivy":
             continue
-        item: dict = {"id": e.id, "statement": _statement(e)}
-        if e.paths:
-            item["paths"] = list(e.paths)
-        misconfigurations.append(item)
-        vulnerabilities.append(dict(item))
+        misconfigurations.append(_yaml_entry(e))
+        vulnerabilities.append(_yaml_entry(e))
     header = (
         "# Generated from .github/security-exceptions.yml - do not edit by hand.\n"
         "# `paths` are relative to the trivy scan root, not the repo root.\n"
     )
-    body = yaml.safe_dump(
+    body = yaml.dump(
         {"misconfigurations": misconfigurations, "vulnerabilities": vulnerabilities},
+        Dumper=_NoAliasDumper,
         sort_keys=False,
         default_flow_style=False,
         allow_unicode=True,

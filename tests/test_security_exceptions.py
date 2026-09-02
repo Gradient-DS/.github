@@ -495,3 +495,20 @@ def test_cli_prints_plain_path_when_nothing_is_scoped(tmp_path, capsys):
                "--emit-trivyignore", str(base)])
     assert rc == 0
     assert capsys.readouterr().out.strip() == str(base)
+
+
+def test_yaml_ignorefile_has_no_anchors_or_aliases():
+    """Each id is written under both kinds; if the two entries shared one
+    `paths` list, PyYAML would emit `paths: *id001` for the second. Valid YAML,
+    but a generated file someone reads mid-incident should not need aliases
+    resolved to show which files an exception covers."""
+    scoped = SecurityException(
+        id="KSV017", package="infra", scanner="trivy", reason="r",
+        replacement_considered="rc", usage_analysis="ua", approved_by="@r",
+        recheck=dt.date(2026, 12, 1), paths=("a/b.yaml", "c/d.yaml"),
+    )
+    text = trivyignore_yaml_text([scoped])
+    assert "&id" not in text and "*id" not in text
+    doc = _yaml.safe_load(text)
+    assert doc["misconfigurations"][0]["paths"] == ["a/b.yaml", "c/d.yaml"]
+    assert doc["vulnerabilities"][0]["paths"] == ["a/b.yaml", "c/d.yaml"]
