@@ -34,15 +34,30 @@ needs_gitleaks = pytest.mark.skipif(
 )
 
 
-def _gitleaks_step() -> dict:
-    """The step in the `secrets` job that actually runs the scan."""
+def _secrets_steps() -> list[dict]:
     # `on` is parsed as the boolean True by YAML 1.1, which is why this reads
     # jobs directly rather than validating the whole document.
     wf = yaml.safe_load(WORKFLOW.read_text())
-    steps = wf["jobs"]["secrets"]["steps"]
-    scans = [s for s in steps if "gitleaks git" in (s.get("run") or "")]
+    return wf["jobs"]["secrets"]["steps"]
+
+
+def _gitleaks_step() -> dict:
+    """The step in the `secrets` job that actually runs the scan."""
+    scans = [s for s in _secrets_steps() if "gitleaks git" in (s.get("run") or "")]
     assert len(scans) == 1, f"expected exactly one gitleaks scan step, found {len(scans)}"
     return scans[0]
+
+
+def _repo_checkout_step() -> dict:
+    """The checkout of the CALLER's repository — the first checkout in the job.
+    The later one fetches the shared tooling into a subdirectory."""
+    checkouts = [
+        s for s in _secrets_steps()
+        if str(s.get("uses", "")).startswith("actions/checkout")
+        and "repository" not in (s.get("with") or {})
+    ]
+    assert len(checkouts) == 1, f"expected one caller checkout, found {len(checkouts)}"
+    return checkouts[0]
 
 
 def _script_lines(step: dict) -> list[str]:
@@ -67,6 +82,21 @@ def test_scan_step_pins_the_scan_to_head():
 def test_scan_step_does_not_reintroduce_all_refs():
     command = " ".join(_script_lines(_gitleaks_step()))
     assert "--all" not in command
+
+
+def test_caller_checkout_keeps_full_history():
+    """The other half of the scoping fix, and the easier one to break.
+
+    `--log-opts=--full-history HEAD` limits which REFS are scanned; it is
+    fetch-depth: 0 that makes the commits behind HEAD present at all. A
+    shallow checkout would leave the flag in place and still reduce the scan
+    to the tip commit — a gate that passes because it looked at almost
+    nothing. Neither guard is sufficient alone, so both are asserted."""
+    step = _repo_checkout_step()
+    assert (step.get("with") or {}).get("fetch-depth") == 0, (
+        "the secrets job must check out full history; without fetch-depth: 0 "
+        "the scan silently shrinks to the tip commit"
+    )
 
 
 def test_scan_step_still_fails_the_job_on_a_finding():
