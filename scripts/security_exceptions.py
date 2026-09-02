@@ -3,6 +3,15 @@
 Policy (spec §7): exceptions are a last resort. An entry is legitimate only
 when no fixed version exists AND the package cannot be replaced AND a second
 reviewer has confirmed the vulnerable path is unreachable in our usage.
+
+Scoping. A trivy entry may carry an optional `paths` list naming the files
+that actually produce the finding. Without it the exception is tree-wide,
+which means a NEW offending file added anywhere under the scanned roots
+inherits the exception silently -- acceptable for a CVE in a pinned package,
+dangerous for an IaC check like "container runs privileged". With it, the
+suppression covers only the listed files and a new one still fails the build.
+Paths are relative to the trivy SCAN ROOT (the directory handed to
+`trivy config`, or the path inside the image), not to the repository root.
 """
 from __future__ import annotations
 
@@ -12,7 +21,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -20,6 +29,11 @@ REQUIRED_FIELDS: tuple[str, ...] = (
     "id", "package", "scanner", "reason",
     "replacement_considered", "usage_analysis", "approved_by", "recheck",
 )
+# `paths` is the one OPTIONAL field. It scopes a trivy exception to the files
+# that actually produce the finding, so a new offending file elsewhere in the
+# tree is NOT silently covered by an existing entry. Omitting it keeps the
+# original tree-wide behaviour.
+OPTIONAL_FIELDS: tuple[str, ...] = ("paths",)
 VALID_SCANNERS: tuple[str, ...] = ("pip-audit", "trivy", "npm", "gitleaks")
 NPM_BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 
@@ -42,6 +56,16 @@ GITLEAKS_ID_PATTERN = re.compile(r"^\S+$")
 # this prefix so a package name is never mistaken for an advisory id.
 NPM_PACKAGE_PREFIX = "package:"
 
+# The four top-level kinds trivy's YAML ignore file supports. The plain
+# `.trivyignore` format is kind-agnostic, so an id has to appear under every
+# one of them for the YAML file to suppress exactly what the plain file did.
+TRIVY_IGNORE_KINDS = ("vulnerabilities", "misconfigurations", "secrets", "licenses")
+
+# Glob metacharacters are rejected in `paths`: trivy matches `paths` as a glob,
+# so `["**"]` reads in review as a scoped exception while suppressing the whole
+# tree. An exception must name the files it covers.
+PATH_GLOB_CHARS = "*?["
+
 
 class ExceptionFileError(ValueError):
     """The exception file is malformed or violates policy."""
@@ -61,6 +85,63 @@ class SecurityException:
     usage_analysis: str
     approved_by: str
     recheck: dt.date
+    # Empty means tree-wide, which is what every entry written before this
+    # field existed means. A tuple, not a list, so the dataclass stays frozen
+    # and hashable.
+    paths: tuple[str, ...] = ()
+
+
+def _parse_paths(entry: dict, path: Path, index: int) -> tuple[str, ...]:
+    """Validate and normalise an entry's optional `paths` list.
+
+    Paths are matched by trivy against the file path it REPORTS, which is
+    relative to the scan root -- the directory handed to `trivy config`, or the
+    path inside the image for `trivy image`. They are therefore NOT relative to
+    the repository root: scanning `infrastructure/` reports
+    `previder-prod/node-tuning/x.yaml`, not `infrastructure/previder-prod/...`.
+    """
+    raw = entry.get("paths")
+    if raw is None:
+        return ()
+    if entry["scanner"] != "trivy":
+        raise ExceptionFileError(
+            f"{path}: entry {index} sets 'paths' with scanner "
+            f"{entry['scanner']!r}; only trivy supports path scoping. Leaving "
+            f"it here would read as scoped while suppressing tree-wide."
+        )
+    if not isinstance(raw, list) or not raw:
+        raise ExceptionFileError(
+            f"{path}: entry {index} field 'paths' must be a non-empty list of "
+            f"strings, got {raw!r}. Omit the field for a tree-wide exception."
+        )
+    out: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise ExceptionFileError(
+                f"{path}: entry {index} has a non-string or empty entry in "
+                f"'paths': {value!r}"
+            )
+        if value != value.strip() or any(c in value for c in "\n\r\t"):
+            raise ExceptionFileError(
+                f"{path}: entry {index} path {value!r} has leading or trailing "
+                f"whitespace, or an embedded newline or tab"
+            )
+        if any(c in value for c in PATH_GLOB_CHARS):
+            raise ExceptionFileError(
+                f"{path}: entry {index} path {value!r} contains a glob "
+                f"metacharacter ({', '.join(PATH_GLOB_CHARS)}). Trivy matches "
+                f"'paths' as a glob, so a pattern like '**' would read as "
+                f"scoped while suppressing the whole tree. List the files "
+                f"explicitly, or omit 'paths' for a deliberate tree-wide "
+                f"exception."
+            )
+        if value.startswith("/") or ".." in PurePosixPath(value).parts:
+            raise ExceptionFileError(
+                f"{path}: entry {index} path {value!r} must be relative to the "
+                f"trivy scan root, with no '..' segments"
+            )
+        out.append(value)
+    return tuple(out)
 
 
 def load(path: str | Path) -> list[SecurityException]:
@@ -112,6 +193,7 @@ def load(path: str | Path) -> list[SecurityException]:
         seen.add(entry["id"])
 
         out.append(SecurityException(
+            paths=_parse_paths(entry, path, i),
             id=entry["id"],
             package=entry["package"],
             scanner=entry["scanner"],
@@ -144,6 +226,91 @@ def trivyignore_text(excs: list[SecurityException]) -> str:
             lines.append(f"# {e.package}: {e.reason} (approved by {e.approved_by}, recheck {e.recheck})")
             lines.append(e.id)
     return "\n".join(lines) + "\n"
+
+
+class _NoAliasDumper(yaml.SafeDumper):
+    """SafeDumper that never emits YAML anchors or aliases.
+
+    Each trivy id is written twice (once per kind), so the two entries would
+    otherwise share the same `paths` list object and PyYAML would collapse the
+    second into `paths: *id001`. That is valid YAML and trivy parses it, but a
+    generated file a human reads during an incident should not need the reader
+    to resolve aliases to see which files an exception covers.
+    """
+
+    def ignore_aliases(self, data):  # noqa: D102 - see class docstring
+        return True
+
+
+def _statement(e: SecurityException) -> str:
+    """The one-line note trivy echoes next to a suppressed finding.
+
+    Mirrors the comment the plain format carries, collapsed to one line so it
+    cannot break the YAML document.
+    """
+    return " ".join(
+        f"{e.package}: {e.reason} (approved by {e.approved_by}, "
+        f"recheck {e.recheck})".split()
+    )
+
+
+def trivyignore_yaml_text(excs: list[SecurityException]) -> str:
+    """Render trivy's YAML ignore format, which supports per-path scoping.
+
+    Every trivy id is written under ALL FOUR kinds trivy's YAML ignore file
+    supports -- `vulnerabilities`, `misconfigurations`, `secrets` and
+    `licenses`. That is not belt-and-braces: the plain `.trivyignore` format
+    this replaces is kind-agnostic -- one id there suppresses a finding of any
+    kind -- so listing the id under every kind is what makes the YAML file
+    EQUIVALENT rather than narrower. The `scanner: trivy` field records which
+    tool produced the finding, not which of trivy's scanners, and inventing a
+    classifier over id shapes would fail silently in both directions. An id
+    under a kind it can never match is simply inert.
+    """
+    def _yaml_entry(e: SecurityException) -> dict:
+        # Built fresh per kind, never shared: two dicts pointing at one list
+        # is what makes PyYAML emit an alias.
+        item: dict = {"id": e.id, "statement": _statement(e)}
+        if e.paths:
+            item["paths"] = list(e.paths)
+        return item
+
+    document: dict[str, list[dict]] = {kind: [] for kind in TRIVY_IGNORE_KINDS}
+    for e in excs:
+        if e.scanner != "trivy":
+            continue
+        for kind in TRIVY_IGNORE_KINDS:
+            document[kind].append(_yaml_entry(e))
+    header = (
+        "# Generated from .github/security-exceptions.yml - do not edit by hand.\n"
+        "# `paths` are relative to the trivy scan root, not the repo root.\n"
+    )
+    body = yaml.dump(
+        document,
+        Dumper=_NoAliasDumper,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
+    return header + body
+
+
+def write_trivyignore(excs: list[SecurityException], base_path: str) -> Path:
+    """Write the ignore file trivy should use, and return the path written.
+
+    Trivy selects its parser BY FILE EXTENSION, so the YAML format has to be
+    written at `<base>.yaml`. The plain format is kept for the common case
+    where no exception is path-scoped: it is the format every repo used before
+    this field existed, and keeping it means adding `paths` to one repo cannot
+    change what any other repo's scan does.
+    """
+    if any(e.paths for e in excs if e.scanner == "trivy"):
+        out = Path(f"{base_path}.yaml")
+        out.write_text(trivyignore_yaml_text(excs))
+    else:
+        out = Path(base_path)
+        out.write_text(trivyignore_text(excs))
+    return out
 
 
 def gitleaksignore_text(excs: list[SecurityException]) -> str:
@@ -210,7 +377,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--file", required=True)
     ap.add_argument("--emit-args", action="store_true")
-    ap.add_argument("--emit-trivyignore")
+    # Takes a BASE path, not a final one: the helper appends `.yaml` when it
+    # has to emit trivy's YAML format (trivy picks the parser by extension) and
+    # prints the path it actually wrote on stdout, which is the caller's only
+    # contract. Do not combine with --emit-args in one call; both write to
+    # stdout.
+    ap.add_argument("--emit-trivyignore", metavar="BASE_PATH")
     ap.add_argument("--emit-gitleaksignore")
     ap.add_argument("--check-expiry", action="store_true")
     ap.add_argument("--npm-audit-json")
@@ -238,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
         print(" ".join(pip_audit_args(excs)))
 
     if args.emit_trivyignore:
-        Path(args.emit_trivyignore).write_text(trivyignore_text(excs))
+        print(write_trivyignore(excs, args.emit_trivyignore))
 
     if args.emit_gitleaksignore:
         Path(args.emit_gitleaksignore).write_text(gitleaksignore_text(excs))
