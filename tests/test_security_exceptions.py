@@ -2,6 +2,7 @@ import datetime as dt
 import pathlib
 import pytest
 from scripts.security_exceptions import (
+    TRIVY_IGNORE_KINDS,
     ExceptionFileError, NpmAuditError, SecurityException, load,
     expired, gitleaksignore_text, main, npm_unexcepted, pip_audit_args,
     trivyignore_text, trivyignore_yaml_text, write_trivyignore,
@@ -395,6 +396,18 @@ def test_path_with_embedded_newline_is_rejected(tmp_path):
         load(_write(tmp_path, text))
 
 
+@pytest.mark.parametrize(
+    "bad", ["**", "*", "a/*.yaml", "previder-prod/**/x.yaml", "a?.yaml", "a[0-9].yaml"]
+)
+def test_paths_with_glob_metacharacters_are_rejected(tmp_path, bad):
+    """Trivy matches `paths` as a glob, so `["**"]` reads in review as a scoped
+    exception while suppressing the entire tree — exactly the failure mode the
+    field exists to prevent. A scoped entry must name its files."""
+    text = _scoped(f'    paths:\n      - "{bad}"\n')
+    with pytest.raises(ExceptionFileError, match="glob metacharacter"):
+        load(_write(tmp_path, text))
+
+
 def test_empty_path_entry_is_rejected(tmp_path):
     text = _scoped('    paths:\n      - "   "\n')
     with pytest.raises(ExceptionFileError, match="non-string or empty"):
@@ -419,13 +432,18 @@ def test_yaml_ignorefile_omits_paths_for_tree_wide_entries():
     assert "paths" not in mis
 
 
-def test_yaml_ignorefile_lists_each_id_under_both_kinds():
-    """The plain format is kind-agnostic — one id there suppresses a
-    misconfiguration and a vulnerability alike. Listing the id under both
-    kinds is what keeps the YAML file equivalent rather than narrower."""
+def test_yaml_ignorefile_lists_each_id_under_all_four_kinds():
+    """The plain format is kind-agnostic — one id there suppresses a finding of
+    any kind. Trivy's YAML format has four: vulnerabilities, misconfigurations,
+    secrets and licenses. Listing the id under every one of them is what keeps
+    the YAML file equivalent rather than narrower."""
     doc = _yaml.safe_load(trivyignore_yaml_text([_exc("CVE-1", scanner="trivy")]))
-    assert [e["id"] for e in doc["misconfigurations"]] == ["CVE-1"]
-    assert [e["id"] for e in doc["vulnerabilities"]] == ["CVE-1"]
+    assert set(doc) == set(TRIVY_IGNORE_KINDS)
+    assert set(TRIVY_IGNORE_KINDS) == {
+        "vulnerabilities", "misconfigurations", "secrets", "licenses",
+    }
+    for kind in TRIVY_IGNORE_KINDS:
+        assert [e["id"] for e in doc[kind]] == ["CVE-1"], kind
 
 
 def test_yaml_ignorefile_excludes_other_scanners():

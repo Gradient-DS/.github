@@ -56,6 +56,16 @@ GITLEAKS_ID_PATTERN = re.compile(r"^\S+$")
 # this prefix so a package name is never mistaken for an advisory id.
 NPM_PACKAGE_PREFIX = "package:"
 
+# The four top-level kinds trivy's YAML ignore file supports. The plain
+# `.trivyignore` format is kind-agnostic, so an id has to appear under every
+# one of them for the YAML file to suppress exactly what the plain file did.
+TRIVY_IGNORE_KINDS = ("vulnerabilities", "misconfigurations", "secrets", "licenses")
+
+# Glob metacharacters are rejected in `paths`: trivy matches `paths` as a glob,
+# so `["**"]` reads in review as a scoped exception while suppressing the whole
+# tree. An exception must name the files it covers.
+PATH_GLOB_CHARS = "*?["
+
 
 class ExceptionFileError(ValueError):
     """The exception file is malformed or violates policy."""
@@ -113,8 +123,17 @@ def _parse_paths(entry: dict, path: Path, index: int) -> tuple[str, ...]:
             )
         if value != value.strip() or any(c in value for c in "\n\r\t"):
             raise ExceptionFileError(
-                f"{path}: entry {index} path {value!r} has leading, trailing "
-                f"or embedded whitespace"
+                f"{path}: entry {index} path {value!r} has leading or trailing "
+                f"whitespace, or an embedded newline or tab"
+            )
+        if any(c in value for c in PATH_GLOB_CHARS):
+            raise ExceptionFileError(
+                f"{path}: entry {index} path {value!r} contains a glob "
+                f"metacharacter ({', '.join(PATH_GLOB_CHARS)}). Trivy matches "
+                f"'paths' as a glob, so a pattern like '**' would read as "
+                f"scoped while suppressing the whole tree. List the files "
+                f"explicitly, or omit 'paths' for a deliberate tree-wide "
+                f"exception."
             )
         if value.startswith("/") or ".." in PurePosixPath(value).parts:
             raise ExceptionFileError(
@@ -238,15 +257,15 @@ def _statement(e: SecurityException) -> str:
 def trivyignore_yaml_text(excs: list[SecurityException]) -> str:
     """Render trivy's YAML ignore format, which supports per-path scoping.
 
-    Every trivy id is written under BOTH `misconfigurations` and
-    `vulnerabilities`. That is not belt-and-braces: the plain `.trivyignore`
-    format this replaces is kind-agnostic -- one id there suppresses a
-    misconfiguration and a vulnerability alike -- so listing the id under both
-    kinds is what makes the YAML file EQUIVALENT rather than narrower. The
-    `scanner: trivy` field records which tool produced the finding, not which
-    of trivy's two scanners, and inventing a classifier over id shapes would
-    fail silently in both directions. An id under the wrong kind simply never
-    matches.
+    Every trivy id is written under ALL FOUR kinds trivy's YAML ignore file
+    supports -- `vulnerabilities`, `misconfigurations`, `secrets` and
+    `licenses`. That is not belt-and-braces: the plain `.trivyignore` format
+    this replaces is kind-agnostic -- one id there suppresses a finding of any
+    kind -- so listing the id under every kind is what makes the YAML file
+    EQUIVALENT rather than narrower. The `scanner: trivy` field records which
+    tool produced the finding, not which of trivy's scanners, and inventing a
+    classifier over id shapes would fail silently in both directions. An id
+    under a kind it can never match is simply inert.
     """
     def _yaml_entry(e: SecurityException) -> dict:
         # Built fresh per kind, never shared: two dicts pointing at one list
@@ -256,19 +275,18 @@ def trivyignore_yaml_text(excs: list[SecurityException]) -> str:
             item["paths"] = list(e.paths)
         return item
 
-    misconfigurations: list[dict] = []
-    vulnerabilities: list[dict] = []
+    document: dict[str, list[dict]] = {kind: [] for kind in TRIVY_IGNORE_KINDS}
     for e in excs:
         if e.scanner != "trivy":
             continue
-        misconfigurations.append(_yaml_entry(e))
-        vulnerabilities.append(_yaml_entry(e))
+        for kind in TRIVY_IGNORE_KINDS:
+            document[kind].append(_yaml_entry(e))
     header = (
         "# Generated from .github/security-exceptions.yml - do not edit by hand.\n"
         "# `paths` are relative to the trivy scan root, not the repo root.\n"
     )
     body = yaml.dump(
-        {"misconfigurations": misconfigurations, "vulnerabilities": vulnerabilities},
+        document,
         Dumper=_NoAliasDumper,
         sort_keys=False,
         default_flow_style=False,
