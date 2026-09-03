@@ -530,3 +530,85 @@ def test_yaml_ignorefile_has_no_anchors_or_aliases():
     doc = _yaml.safe_load(text)
     assert doc["misconfigurations"][0]["paths"] == ["a/b.yaml", "c/d.yaml"]
     assert doc["vulnerabilities"][0]["paths"] == ["a/b.yaml", "c/d.yaml"]
+
+
+# --- gitleaks `ids` grouping -------------------------------------------------
+
+GITLEAKS_IDS_ENTRY = """
+version: 1
+exceptions:
+  - ids:
+      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/a.md:generic-api-key:10
+      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/b.md:generic-api-key:12
+      - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:docs/a.md:generic-api-key:10
+    package: docs
+    scanner: gitleaks
+    reason: False positive; the same placeholder token in three deleted docs.
+    replacement_considered: Deleted files in immutable history.
+    usage_analysis: A placeholder; authenticates nothing.
+    approved_by: "@some-reviewer"
+    recheck: 2026-12-01
+"""
+
+def test_gitleaks_ids_expand_to_one_exception_each(tmp_path):
+    excs = load(_write(tmp_path, GITLEAKS_IDS_ENTRY))
+    assert [e.id for e in excs] == [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/a.md:generic-api-key:10",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/b.md:generic-api-key:12",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:docs/a.md:generic-api-key:10",
+    ]
+    assert {e.reason for e in excs} == {
+        "False positive; the same placeholder token in three deleted docs."
+    }
+    text = gitleaksignore_text(excs)
+    for e in excs:
+        assert e.id in text
+
+def test_gitleaks_ids_duplicate_within_group_is_rejected(tmp_path):
+    text = GITLEAKS_IDS_ENTRY.replace(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:docs/a.md:generic-api-key:10",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/a.md:generic-api-key:10",
+    )
+    with pytest.raises(ExceptionFileError, match="duplicate"):
+        load(_write(tmp_path, text))
+
+def test_gitleaks_ids_duplicate_across_entries_is_rejected(tmp_path):
+    single = GITLEAKS_IDS_ENTRY.split("exceptions:")[1].replace(
+        "  - ids:\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/a.md:generic-api-key:10\n"
+        "      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/b.md:generic-api-key:12\n"
+        "      - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:docs/a.md:generic-api-key:10\n",
+        "  - id: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/b.md:generic-api-key:12\n",
+    )
+    assert "  - id: " in single
+    with pytest.raises(ExceptionFileError, match="duplicate"):
+        load(_write(tmp_path, GITLEAKS_IDS_ENTRY + single))
+
+def test_gitleaks_ids_with_whitespace_is_rejected(tmp_path):
+    text = GITLEAKS_IDS_ENTRY.replace(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:docs/a.md:generic-api-key:10",
+        '"bbbbbbbb:docs/a b.md:generic-api-key:10"',
+    )
+    with pytest.raises(ExceptionFileError, match="invalid id"):
+        load(_write(tmp_path, text))
+
+def test_ids_on_non_gitleaks_scanner_is_rejected(tmp_path):
+    text = GITLEAKS_IDS_ENTRY.replace("scanner: gitleaks", "scanner: pip-audit")
+    with pytest.raises(ExceptionFileError, match="only gitleaks"):
+        load(_write(tmp_path, text))
+
+def test_ids_and_id_together_is_rejected(tmp_path):
+    text = GITLEAKS_IDS_ENTRY.replace(
+        "  - ids:", "  - id: cccccccccccccccccccccccccccccccccccccccc:x:generic-api-key:1\n    ids:"
+    )
+    with pytest.raises(ExceptionFileError, match="both"):
+        load(_write(tmp_path, text))
+
+def test_empty_ids_is_rejected(tmp_path):
+    text = GITLEAKS_IDS_ENTRY.replace(
+        "  - ids:\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/a.md:generic-api-key:10\n"
+        "      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:docs/b.md:generic-api-key:12\n"
+        "      - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:docs/a.md:generic-api-key:10\n",
+        "  - ids: []\n",
+    )
+    with pytest.raises(ExceptionFileError, match="non-empty"):
+        load(_write(tmp_path, text))
