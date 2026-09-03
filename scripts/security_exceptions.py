@@ -12,6 +12,13 @@ dangerous for an IaC check like "container runs privileged". With it, the
 suppression covers only the listed files and a new one still fails the build.
 Paths are relative to the trivy SCAN ROOT (the directory handed to
 `trivy config`, or the path inside the image), not to the repository root.
+
+Grouping. A gitleaks entry may carry an `ids` list instead of a single `id`
+when ONE value produced several fingerprints (the same placeholder in five
+deleted docs, the same webhook on thirteen lines). The prose is written once
+and every fingerprint in the list is suppressed by it; each still has to be
+unique across the file. Only gitleaks supports this: a CVE id names a
+finding on its own, so grouping would hide which advisory a reason covers.
 """
 from __future__ import annotations
 
@@ -33,7 +40,9 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 # that actually produce the finding, so a new offending file elsewhere in the
 # tree is NOT silently covered by an existing entry. Omitting it keeps the
 # original tree-wide behaviour.
-OPTIONAL_FIELDS: tuple[str, ...] = ("paths",)
+# `ids` is the other optional field: a gitleaks-only alternative to `id` that
+# lets one justification cover every fingerprint the SAME value produced.
+OPTIONAL_FIELDS: tuple[str, ...] = ("paths", "ids")
 VALID_SCANNERS: tuple[str, ...] = ("pip-audit", "trivy", "npm", "gitleaks")
 NPM_BLOCKING_SEVERITIES = frozenset({"high", "critical"})
 
@@ -144,6 +153,43 @@ def _parse_paths(entry: dict, path: Path, index: int) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _parse_ids(entry: dict, path: Path, index: int) -> tuple[str, ...]:
+    """Validate an entry's optional `ids` list (gitleaks only).
+
+    Returns an empty tuple when the entry uses a plain `id`. The per-id
+    pattern check and the cross-file duplicate check happen in `load`, once
+    per expanded id, exactly as for a single `id`.
+    """
+    raw = entry.get("ids")
+    if raw is None:
+        return ()
+    if str(entry.get("id", "")).strip():
+        raise ExceptionFileError(
+            f"{path}: entry {index} sets both 'id' and 'ids'; use one. A "
+            f"reader cannot tell which fingerprints the prose covers otherwise."
+        )
+    if entry.get("scanner") != "gitleaks":
+        raise ExceptionFileError(
+            f"{path}: entry {index} sets 'ids' with scanner "
+            f"{entry.get('scanner')!r}; only gitleaks fingerprints may be "
+            f"grouped. A CVE id names its own finding and needs its own reason."
+        )
+    if not isinstance(raw, list) or not raw:
+        raise ExceptionFileError(
+            f"{path}: entry {index} field 'ids' must be a non-empty list of "
+            f"fingerprints, got {raw!r}. Use 'id' for a single fingerprint."
+        )
+    out: list[str] = []
+    for value in raw:
+        if not isinstance(value, str) or not value.strip():
+            raise ExceptionFileError(
+                f"{path}: entry {index} has a non-string or empty entry in "
+                f"'ids': {value!r}"
+            )
+        out.append(value)
+    return tuple(out)
+
+
 def load(path: str | Path) -> list[SecurityException]:
     path = Path(path)
     if not path.exists():
@@ -155,7 +201,11 @@ def load(path: str | Path) -> list[SecurityException]:
     out: list[SecurityException] = []
     seen: set[str] = set()
     for i, entry in enumerate(entries):
-        missing = [f for f in REQUIRED_FIELDS if not str(entry.get(f, "")).strip()]
+        ids = _parse_ids(entry, path, i)
+        missing = [
+            f for f in REQUIRED_FIELDS
+            if not str(entry.get(f, "")).strip() and not (f == "id" and ids)
+        ]
         if missing:
             raise ExceptionFileError(
                 f"{path}: entry {i} is missing required field(s): {', '.join(missing)}"
@@ -183,26 +233,30 @@ def load(path: str | Path) -> list[SecurityException]:
         else:
             id_pattern = ID_PATTERN
             id_pattern_desc = "letters, digits, dot, underscore, hyphen"
-        if not id_pattern.fullmatch(str(entry["id"])):
-            raise ExceptionFileError(
-                f"{path}: entry {i} has invalid id {entry['id']!r}; ids must match "
-                f"{id_pattern.pattern} ({id_pattern_desc})"
-            )
-        if entry["id"] in seen:
-            raise ExceptionFileError(f"{path}: duplicate exception id {entry['id']!r}")
-        seen.add(entry["id"])
+        # An `ids` entry expands to one SecurityException per fingerprint,
+        # sharing every other field, so the emitters and the duplicate check
+        # need no knowledge of grouping.
+        for one_id in (ids or (str(entry["id"]),)):
+            if not id_pattern.fullmatch(one_id):
+                raise ExceptionFileError(
+                    f"{path}: entry {i} has invalid id {one_id!r}; ids must match "
+                    f"{id_pattern.pattern} ({id_pattern_desc})"
+                )
+            if one_id in seen:
+                raise ExceptionFileError(f"{path}: duplicate exception id {one_id!r}")
+            seen.add(one_id)
 
-        out.append(SecurityException(
-            paths=_parse_paths(entry, path, i),
-            id=entry["id"],
-            package=entry["package"],
-            scanner=entry["scanner"],
-            reason=entry["reason"],
-            replacement_considered=entry["replacement_considered"],
-            usage_analysis=entry["usage_analysis"],
-            approved_by=entry["approved_by"],
-            recheck=entry["recheck"],
-        ))
+            out.append(SecurityException(
+                paths=_parse_paths(entry, path, i),
+                id=one_id,
+                package=entry["package"],
+                scanner=entry["scanner"],
+                reason=entry["reason"],
+                replacement_considered=entry["replacement_considered"],
+                usage_analysis=entry["usage_analysis"],
+                approved_by=entry["approved_by"],
+                recheck=entry["recheck"],
+            ))
     return out
 
 

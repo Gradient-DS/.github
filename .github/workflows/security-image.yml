@@ -29,6 +29,15 @@ on:
           branch, or to keep the helper in step with a caller pinned at @main.
         type: string
         default: 'v1'
+    secrets:
+      build-secrets:
+        description: >-
+          Newline-separated `id=value` BuildKit secrets, forwarded verbatim to
+          docker/build-push-action's `secrets:` input, for a Dockerfile that
+          mounts one with `--mount=type=secret,id=...` (e.g. a read token for a
+          private git dependency). A secret, never a build-arg: ARGs persist in
+          image history and would surface in the scanned image.
+        required: false
 
 jobs:
   scan:
@@ -91,6 +100,7 @@ jobs:
           push: false
           tags: ${{ inputs.image-name }}:scan
           build-args: ${{ inputs.build-args }}
+          secrets: ${{ secrets.build-secrets }}
           cache-from: type=gha
 
       - name: Trivy vulnerability scan

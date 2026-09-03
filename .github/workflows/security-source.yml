@@ -34,6 +34,16 @@ on:
           branch, or to keep the helper in step with a caller pinned at @main.
         type: string
         default: 'v1'
+    secrets:
+      git-token:
+        description: >-
+          Token with read access to private git dependencies (a requirements
+          file pinning `git+https://github.com/<org>/<private-repo>`). pip-audit
+          resolves the file in a scratch venv, so pip has to clone the repo;
+          without a token the whole audit aborts at that line and nothing after
+          it is audited. Handed to git through GIT_CONFIG_* environment
+          variables only — no netrc, no file, nothing in the workspace.
+        required: false
 
 env:
   TOOLING_PATH: .security-tooling
@@ -116,6 +126,20 @@ jobs:
           enable-cache: true
           python-version: '3.12'
 
+      # A private git pin makes pip shell out to git for a clone. The token
+      # reaches git through its environment-variable config only; an empty
+      # secret leaves the three variables empty, which git ignores.
+      - name: Point git at the private-dependency token
+        if: env.GIT_TOKEN != ''
+        env:
+          GIT_TOKEN: ${{ secrets.git-token }}
+        run: |
+          {
+            echo "GIT_CONFIG_COUNT=1"
+            echo "GIT_CONFIG_KEY_0=url.https://x-access-token:${GIT_TOKEN}@github.com/.insteadOf"
+            echo "GIT_CONFIG_VALUE_0=https://github.com/"
+          } >> "$GITHUB_ENV"
+
       - name: Audit uv lockfile
         if: inputs.python-uv
         env:
@@ -132,12 +156,17 @@ jobs:
           PYTHON_REQS: ${{ inputs.python-requirements }}
           PIP_AUDIT_ARGS: ${{ steps.ignores.outputs.args }}
         run: |
+          # Every file is audited even after one fails, so a single run
+          # reports every offending file; the accumulator keeps a later clean
+          # file from masking an earlier failure.
+          rc=0
           # shellcheck disable=SC2086
           for f in $PYTHON_REQS; do
             echo "::group::pip-audit $f"
-            pip-audit --desc on -r "$f" $PIP_AUDIT_ARGS
+            pip-audit --desc on -r "$f" $PIP_AUDIT_ARGS || rc=1
             echo "::endgroup::"
           done
+          exit "$rc"
 
   sca-node:
     name: Node Dependencies (npm audit)
