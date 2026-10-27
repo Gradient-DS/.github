@@ -1,0 +1,36 @@
+name: Security Scanning
+
+# Shared security scans from Gradient-DS/security-ci. `gate` is the check the
+# org rulesets require once this repo is tier production (security-ci
+# governance/README.md); gitleaks always scans the full history.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  source:
+    if: github.event.pull_request.draft != true
+    uses: Gradient-DS/security-ci/.github/workflows/security-source.yml@ea8fc9cdf3c1e54c1ff8958bed1cfff2cc4221ed # v12
+    secrets: inherit
+    permissions:
+      contents: read
+      issues: write
+
+  gate:
+    needs: [source]
+    if: ${{ always() && github.event.pull_request.draft != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every security job succeeded
+        env:
+          SOURCE: ${{ needs.source.result }}
+        run: |
+          echo "source=$SOURCE"
+          [ "$SOURCE" = "success" ]
