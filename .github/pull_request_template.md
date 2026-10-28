@@ -1,18 +1,10 @@
 ## Linear
-
-<!-- Fixes GRA-123 when this PR completes the ticket, Part of GRA-123 when more PRs follow.
-     Several tickets: Fixes GRA-123, GRA-124. IDs only, never ticket titles. Required: the
-     linear-link check fails without one. No ticket on purpose? Label the PR no-ticket. -->
+<!-- Fixes GRA-123 (completes it) or Part of GRA-123 (more PRs follow). IDs only. -->
 Fixes GRA-
 
-## What & why
+## What changes
+<!-- For a teammate who didn't follow this work: what is different after merge, in plain words. -->
 
-<!-- A few sentences on what this PR changes and the motivation. -->
+## Why
 
 ## How I tested
-
-<!-- e.g. "Added unit tests in X", or the manual steps you ran. -->
-
-## Checklist
-
-- [ ] No secrets or credentials are committed.
