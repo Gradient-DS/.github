@@ -25,7 +25,7 @@ jobs:
   # Org pre-commit hooks as the CI backstop.
   pre-commit:
     if: github.event.pull_request.draft != true
-    uses: Gradient-DS/security-ci/.github/workflows/pre-commit.yml@v13
+    uses: Gradient-DS/security-ci/.github/workflows/pre-commit.yml@f9642945013e452c0dd9c2eb7ddbcd1bda4361c4 # v13
     secrets: inherit
 
   gate:
