@@ -22,20 +22,22 @@ jobs:
       contents: read
       issues: write
 
-  # Org pre-commit hooks (hygiene, gitleaks, actionlint) as the CI backstop.
+  # Org pre-commit hooks as the CI backstop.
   pre-commit:
     if: github.event.pull_request.draft != true
     uses: Gradient-DS/security-ci/.github/workflows/pre-commit.yml@v13
+    secrets: inherit
 
   gate:
-    needs: [source]
+    needs: [source, pre-commit]
     if: ${{ always() && github.event.pull_request.draft != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Fail unless every security job succeeded
         env:
+          PRECOMMIT: ${{ needs.pre-commit.result }}
           SOURCE: ${{ needs.source.result }}
         run: |
-          echo "source=$SOURCE"
-          [ "$SOURCE" = "success" ]
+          echo "source=$SOURCE  pre-commit=$PRECOMMIT"
+          [ "$SOURCE" = "success" ] && [ "$PRECOMMIT" = "success" ]
