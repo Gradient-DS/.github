@@ -16,7 +16,7 @@ on:
 jobs:
   source:
     if: github.event.pull_request.draft != true
-    uses: Gradient-DS/security-ci/.github/workflows/security-source.yml@ade6cdd8c26f678ed19801839b10aa0e9c178c77 # v15
+    uses: Gradient-DS/security-ci/.github/workflows/security-source.yml@71dea3696135309a19a1541157a249821bc08a2b # v16
     secrets: inherit
     permissions:
       contents: read
@@ -24,7 +24,7 @@ jobs:
   # Org pre-commit hooks as the CI backstop.
   pre-commit:
     if: github.event.pull_request.draft != true
-    uses: Gradient-DS/security-ci/.github/workflows/pre-commit.yml@ade6cdd8c26f678ed19801839b10aa0e9c178c77 # v15
+    uses: Gradient-DS/security-ci/.github/workflows/pre-commit.yml@71dea3696135309a19a1541157a249821bc08a2b # v16
     secrets: inherit
 
   gate:
